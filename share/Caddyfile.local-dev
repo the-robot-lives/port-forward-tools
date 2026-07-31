@@ -1,0 +1,55 @@
+# Pattern A: Host-based reverse proxy on :80 → cluster-port-forward local ports
+# Requires: caddy, cluster-port-forward watch data ai apps
+# Hosts: either 127.0.0.1 for all names, or 10.0.0.x with Caddy bind 0.0.0.0:80
+#
+#   brew install caddy
+#   sudo caddy run --config share/Caddyfile.local-dev
+
+{
+	auto_https off
+	admin off
+}
+
+local.dev {
+	respond "Noizu local-dev edge OK — see local-dev-hosts.md" 200
+}
+
+weaviate.dev, weaviate.dev.noizu.local {
+	reverse_proxy 127.0.0.1:18081
+}
+
+qdrant.dev, qdrant.dev.noizu.local {
+	reverse_proxy 127.0.0.1:16333
+}
+
+infisical.dev, infisical.dev.noizu.local {
+	reverse_proxy 127.0.0.1:18080
+}
+
+minio-console.dev, minio-console.dev.noizu.local {
+	reverse_proxy 127.0.0.1:9001
+}
+
+minio.dev, minio.dev.noizu.local {
+	reverse_proxy 127.0.0.1:9000
+}
+
+api.therobotplans.dev, api.therobotplans.dev.noizu.local {
+	reverse_proxy 127.0.0.1:14000
+}
+
+app.therobotplans.dev, app.therobotplans.dev.noizu.local, therobotplans.dev {
+	reverse_proxy 127.0.0.1:13000
+}
+
+mcp.npl.dev, mcp.npl.dev.noizu.local {
+	reverse_proxy 127.0.0.1:14040
+}
+
+app.npl.dev, app.npl.dev.noizu.local, npl.dev {
+	reverse_proxy 127.0.0.1:13040
+}
+
+therobotdrafts.dev, therobotdrafts.dev.noizu.local {
+	reverse_proxy 127.0.0.1:14041
+}

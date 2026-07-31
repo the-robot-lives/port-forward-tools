@@ -1,0 +1,72 @@
+# /etc/sudoers.d/noizu-local-dev
+#
+# Passwordless sudo for cluster-port-forward aliases + hosts install.
+# Digests pin the binaries so a replaced ifconfig/tee/cp won't match.
+#
+# Install (as root, after visudo -c):
+#   sudo cp share/sudoers.d-noizu-local-dev /etc/sudoers.d/noizu-local-dev
+#   sudo chmod 440 /etc/sudoers.d/noizu-local-dev
+#   sudo visudo -c
+#
+# Generated for macOS paths; re-run digests after OS update if sudo starts failing:
+#   shasum -a 256 /sbin/ifconfig /usr/bin/tee /bin/cp
+#
+# User: set NOIZU_USER below (default keithbrings) or replace with %admin
+
+Defaults!NOIZU_LOCAL_DEV !requiretty
+
+# --- Binary digests (sha256 of file contents) ---
+# /sbin/ifconfig  97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d
+# /usr/bin/tee    66209fd96c22f02e56232db65cba8feccec0fa607a2f179a5e927ddc215651c6
+# /bin/cp         07cdcfe6a6474d9abac66f0b1959e2e9e4877bf4629e2e400249a3e7641b09f9
+
+Cmnd_Alias NOIZU_IFCONFIG_ALIAS = \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.1 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.10 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.11 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.12 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.13 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.14 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.15 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.20 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.21 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.22 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.41 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.42 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.43 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.44 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.60 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.61 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.62 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.63 netmask 255.255.255.0, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 alias 10.0.0.64 netmask 255.255.255.0
+
+Cmnd_Alias NOIZU_IFCONFIG_UNALIAS = \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.1, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.10, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.11, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.12, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.13, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.14, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.15, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.20, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.21, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.22, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.41, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.42, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.43, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.44, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.60, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.61, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.62, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.63, \
+    sha256:97de29617cd5de6967b10619b4b118318925df86ca1045f24bba845b5bf67d3d /sbin/ifconfig lo0 -alias 10.0.0.64
+
+# Full rewrite of /etc/hosts only (script writes complete file to stdin of tee)
+Cmnd_Alias NOIZU_HOSTS_TEE = \
+    sha256:66209fd96c22f02e56232db65cba8feccec0fa607a2f179a5e927ddc215651c6 /usr/bin/tee /etc/hosts
+
+Cmnd_Alias NOIZU_LOCAL_DEV = NOIZU_IFCONFIG_ALIAS, NOIZU_IFCONFIG_UNALIAS, NOIZU_HOSTS_TEE
+
+# Replace keithbrings with your username if different
+keithbrings ALL=(root) NOPASSWD: NOIZU_LOCAL_DEV

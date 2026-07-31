@@ -1,0 +1,39 @@
+# Noizu local-dev fabric — append to /etc/hosts (or use with dnsmasq)
+# Pair with:
+#   cluster-port-forward aliases up
+#   cluster-port-forward watch data ai apps
+#   cluster-port-forward hosts install   # or paste this block into /etc/hosts
+#
+# After aliases + bind PF:
+#   http://weaviate.dev/          (port 80)
+#   psql -h app-tsdb.dev -p 5432
+#   redis-cli -h app-valkey.dev
+
+# Edge
+10.0.0.1     local.dev local.dev.noizu.local
+
+# Data (TCP 5432 / 6379)
+10.0.0.10    app-tsdb.dev app-tsdb.dev.noizu.local
+10.0.0.11    app-valkey.dev app-valkey.dev.noizu.local
+10.0.0.12    platform-tsdb.dev platform-tsdb.dev.noizu.local
+10.0.0.13    platform-valkey.dev platform-valkey.dev.noizu.local
+10.0.0.14    infra-tsdb.dev infra-tsdb.dev.noizu.local
+10.0.0.15    infra-valkey.dev infra-valkey.dev.noizu.local
+
+# Infra HTTP
+10.0.0.20    minio.dev minio.dev.noizu.local
+10.0.0.21    minio-console.dev minio-console.dev.noizu.local
+10.0.0.22    infisical.dev infisical.dev.noizu.local
+
+# AI
+10.0.0.41    weaviate.dev weaviate.dev.noizu.local
+10.0.0.42    weaviate-grpc.dev weaviate-grpc.dev.noizu.local
+10.0.0.43    qdrant.dev qdrant.dev.noizu.local
+10.0.0.44    qdrant-grpc.dev qdrant-grpc.dev.noizu.local
+
+# Apps / demos
+10.0.0.60    api.therobotplans.dev api.therobotplans.dev.noizu.local
+10.0.0.61    app.therobotplans.dev app.therobotplans.dev.noizu.local therobotplans.dev
+10.0.0.62    mcp.npl.dev mcp.npl.dev.noizu.local
+10.0.0.63    app.npl.dev app.npl.dev.noizu.local npl.dev
+10.0.0.64    therobotdrafts.dev therobotdrafts.dev.noizu.local

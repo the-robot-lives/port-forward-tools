@@ -1,0 +1,577 @@
+#!/usr/bin/env bash
+# cluster-port-forward — keep kubectl port-forwards alive for local tests vs cluster data.
+#
+# Supervises multiple kubectl port-forward processes; restarts on disconnect/exit.
+# Optional bind_ip/bind_port for static 10.0.0.x aliases (clean hostnames, std ports).
+#
+# Usage:
+#   cluster-port-forward start [profile|name ...]   # default: data
+#   cluster-port-forward watch [profile|name ...]   # start + supervise (foreground)
+#   cluster-port-forward stop  [name|all]
+#   cluster-port-forward status
+#   cluster-port-forward list
+#   cluster-port-forward doctor
+#   cluster-port-forward hosts print|install|uninstall
+#   cluster-port-forward aliases up|down|status
+#
+# Profiles: data | platform | infra | ai | apps | minio | all
+#
+# Env:
+#   KUBECONFIG          default: ~/.kube/noizu/config
+#   KUBE_CONTEXT        optional kubectl --context
+#   CPF_STATE_DIR       default: ${XDG_RUNTIME_DIR:-/tmp}/noizu-port-forwards
+#   CPF_CATALOG         override catalog path
+#   CPF_HOSTS_FILE      hosts block source (default: share/hosts.local-dev)
+#   CPF_BIND            1 (default) also PF to bind_ip:bind_port when catalog has them
+#   CPF_POLL_SEC        supervisor poll interval (default 3)
+#   CPF_LOG             log file
+#
+set -euo pipefail
+
+: "${KUBECONFIG:=${HOME}/.kube/noizu/config}"
+export KUBECONFIG
+: "${CPF_BIND:=1}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+resolve_share_file() {
+  local base="$1"
+  if [[ -n "${2:-}" && -f "$2" ]]; then
+    echo "$2"
+    return
+  fi
+  local c
+  for c in \
+    "$SCRIPT_DIR/../share/$base" \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/noizu-port-forwards/$base" \
+    "$HOME/.local/share/noizu-port-forwards/$base"
+  do
+    if [[ -f "$c" ]]; then
+      echo "$c"
+      return
+    fi
+  done
+  echo ""
+}
+
+CATALOG="$(resolve_share_file port-forwards.catalog "${CPF_CATALOG:-}")"
+HOSTS_SRC="$(resolve_share_file hosts.local-dev "${CPF_HOSTS_FILE:-}")"
+STATE_DIR="${CPF_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/noizu-port-forwards}"
+POLL_SEC="${CPF_POLL_SEC:-3}"
+LOG_FILE="${CPF_LOG:-$STATE_DIR/supervisor.log}"
+HOSTS_MARKER_BEGIN="# BEGIN noizu-local-dev"
+HOSTS_MARKER_END="# END noizu-local-dev"
+
+KUBECTL=(kubectl)
+if [[ -n "${KUBE_CONTEXT:-}" ]]; then
+  KUBECTL+=(--context "$KUBE_CONTEXT")
+fi
+
+mkdir -p "$STATE_DIR"
+
+info()  { echo "→ $*"; }
+ok()    { echo "✓ $*"; }
+warn()  { echo "⚠️  $*" >&2; }
+fail()  { echo "❌ $*" >&2; exit 1; }
+log()   { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOG_FILE"; }
+
+read_lines() {
+  local __var="$1" __line
+  eval "$__var=()"
+  while IFS= read -r __line || [[ -n "$__line" ]]; do
+    [[ -z "$__line" ]] && continue
+    eval "$__var+=(\"\$__line\")"
+  done
+}
+
+usage() {
+  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# --- Catalog -----------------------------------------------------------------
+declare -a NAME NS SVC REMOTE LOCAL PROFILES BIND_IP BIND_PORT
+
+load_catalog() {
+  NAME=(); NS=(); SVC=(); REMOTE=(); LOCAL=(); PROFILES=(); BIND_IP=(); BIND_PORT=()
+  [[ -f "$CATALOG" ]] || fail "Catalog not found: $CATALOG (set CPF_CATALOG)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    # name ns svc remote local profiles [bind_ip] [bind_port]
+    set -- $line
+    local n="${1:-}" ns_="${2:-}" svc_="${3:-}" rp="${4:-}" lp="${5:-}" prof="${6:-}" bip="${7:-}" bp="${8:-}"
+    [[ -z "$n" ]] && continue
+    NAME+=("$n"); NS+=("$ns_"); SVC+=("$svc_"); REMOTE+=("$rp"); LOCAL+=("$lp")
+    PROFILES+=("$prof"); BIND_IP+=("${bip:-}"); BIND_PORT+=("${bp:-}")
+  done <"$CATALOG"
+}
+
+index_of() {
+  local target="$1" i
+  for i in "${!NAME[@]}"; do
+    [[ "${NAME[$i]}" == "$target" ]] && { echo "$i"; return 0; }
+  done
+  return 1
+}
+
+resolve_selection() {
+  local -a tokens=("$@") out=()
+  [[ ${#tokens[@]} -eq 0 ]] && tokens=(data)
+  local t i prof
+  for t in "${tokens[@]}"; do
+    case "$t" in
+      all|data|platform|infra|ai|apps|minio)
+        for i in "${!NAME[@]}"; do
+          IFS=',' read -ra profs <<<"${PROFILES[$i]}"
+          for prof in "${profs[@]}"; do
+            if [[ "$prof" == "$t" || "$t" == all ]]; then
+              out+=("${NAME[$i]}")
+              break
+            fi
+          done
+        done
+        ;;
+      *)
+        index_of "$t" >/dev/null || fail "Unknown service or profile: $t (try: list)"
+        out+=("$t")
+        ;;
+    esac
+  done
+  local -a uniq=()
+  local u seen x
+  for u in "${out[@]}"; do
+    seen=0
+    for x in "${uniq[@]+"${uniq[@]}"}"; do
+      [[ "$x" == "$u" ]] && { seen=1; break; }
+    done
+    [[ $seen -eq 0 ]] && uniq+=("$u")
+  done
+  printf '%s\n' "${uniq[@]}"
+}
+
+# --- Port / process ----------------------------------------------------------
+# True if host/IP is usable for bind (loopback always; alias IPs must exist on lo0)
+ip_usable() {
+  local host="$1"
+  [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "0.0.0.0" ]] && return 0
+  # macOS / Linux: address assigned to some interface?
+  if ifconfig 2>/dev/null | grep -q "inet ${host} "; then
+    return 0
+  fi
+  if command -v ip >/dev/null 2>&1 && ip -4 addr show | grep -q "inet ${host}/"; then
+    return 0
+  fi
+  return 1
+}
+
+port_open() {
+  local port="$1" host="${2:-127.0.0.1}"
+  ip_usable "$host" || return 1
+  if command -v nc >/dev/null 2>&1; then
+    # -G / -w for timeout where supported; ignore failure
+    nc -z -G 1 "$host" "$port" 2>/dev/null || nc -z -w 1 "$host" "$port" 2>/dev/null
+  else
+    (echo >"/dev/tcp/${host}/${port}") >/dev/null 2>&1
+  fi
+}
+
+pid_file()  { echo "$STATE_DIR/$1.pid"; }
+pid_file2() { echo "$STATE_DIR/$1.bind.pid"; }  # secondary PF to bind_ip
+meta_file() { echo "$STATE_DIR/$1.meta"; }
+
+is_alive() {
+  local pid="$1"
+  [[ -n "$pid" && "$pid" != "external" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# --- Aliases (macOS lo0) -----------------------------------------------------
+collect_bind_ips() {
+  load_catalog
+  local i ip
+  local -a ips=()
+  for i in "${!NAME[@]}"; do
+    ip="${BIND_IP[$i]}"
+    [[ -z "$ip" ]] && continue
+    local seen=0 x
+    for x in "${ips[@]+"${ips[@]}"}"; do
+      [[ "$x" == "$ip" ]] && { seen=1; break; }
+    done
+    [[ $seen -eq 0 ]] && ips+=("$ip")
+  done
+  # always include edge
+  local has1=0
+  for x in "${ips[@]+"${ips[@]}"}"; do [[ "$x" == "10.0.0.1" ]] && has1=1; done
+  [[ $has1 -eq 0 ]] && ips=("10.0.0.1" "${ips[@]+"${ips[@]}"}")
+  printf '%s\n' "${ips[@]}"
+}
+
+cmd_aliases() {
+  local sub="${1:-status}"
+  shift || true
+  case "$sub" in
+    up)
+      local ip
+      info "Adding lo0 aliases (sudo /sbin/ifconfig; NOPASSWD via sudoers.d/noizu-local-dev)…"
+      while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        if /sbin/ifconfig lo0 2>/dev/null | grep -q "inet $ip "; then
+          ok "alias already up: $ip"
+        else
+          sudo /sbin/ifconfig lo0 alias "$ip" netmask 255.255.255.0
+          ok "alias up: $ip"
+        fi
+      done < <(collect_bind_ips)
+      ;;
+    down)
+      local ip
+      info "Removing lo0 aliases…"
+      while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        sudo /sbin/ifconfig lo0 -alias "$ip" 2>/dev/null && ok "alias down: $ip" || true
+      done < <(collect_bind_ips)
+      ;;
+    status|st)
+      local ip
+      while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        if /sbin/ifconfig lo0 2>/dev/null | grep -q "inet $ip "; then
+          printf '✓ %s up\n' "$ip"
+        else
+          printf '· %s down\n' "$ip"
+        fi
+      done < <(collect_bind_ips)
+      ;;
+    *) fail "aliases: up | down | status" ;;
+  esac
+}
+
+# --- Hosts -------------------------------------------------------------------
+cmd_hosts() {
+  local sub="${1:-print}"
+  shift || true
+  [[ -f "$HOSTS_SRC" ]] || fail "Hosts file not found (CPF_HOSTS_FILE / share/hosts.local-dev)"
+
+  case "$sub" in
+    print|show)
+      echo "$HOSTS_MARKER_BEGIN"
+      cat "$HOSTS_SRC"
+      echo "$HOSTS_MARKER_END"
+      ;;
+    blurb|copy)
+      # Clean copy-paste only (no markers)
+      cat "$HOSTS_SRC"
+      ;;
+    install)
+      local hosts_path="/etc/hosts"
+      local block tmp
+      block=$(printf '%s\n%s\n%s\n' "$HOSTS_MARKER_BEGIN" "$(cat "$HOSTS_SRC")" "$HOSTS_MARKER_END")
+      tmp=$(mktemp)
+      if grep -q "$HOSTS_MARKER_BEGIN" "$hosts_path" 2>/dev/null; then
+        info "Updating existing Noizu block in $hosts_path…"
+        awk -v b="$HOSTS_MARKER_BEGIN" -v e="$HOSTS_MARKER_END" '
+          $0==b {skip=1; next}
+          $0==e {skip=0; next}
+          !skip {print}
+        ' "$hosts_path" >"$tmp"
+        printf '\n%s\n' "$block" >>"$tmp"
+      else
+        info "Appending Noizu block to $hosts_path…"
+        cat "$hosts_path" >"$tmp"
+        printf '\n%s\n' "$block" >>"$tmp"
+      fi
+      # Full rewrite via tee (matches sudoers NOIZU_HOSTS_TEE — no password if installed)
+      sudo /usr/bin/tee "$hosts_path" <"$tmp" >/dev/null
+      rm -f "$tmp"
+      ok "hosts installed"
+      ;;
+    uninstall)
+      if ! grep -q "$HOSTS_MARKER_BEGIN" /etc/hosts 2>/dev/null; then
+        info "No Noizu block in /etc/hosts"
+        return 0
+      fi
+      info "Removing Noizu block from /etc/hosts…"
+      local tmp
+      tmp=$(mktemp)
+      awk -v b="$HOSTS_MARKER_BEGIN" -v e="$HOSTS_MARKER_END" '
+        $0==b {skip=1; next}
+        $0==e {skip=0; next}
+        !skip {print}
+      ' /etc/hosts >"$tmp"
+      sudo /usr/bin/tee /etc/hosts <"$tmp" >/dev/null
+      rm -f "$tmp"
+      ok "hosts uninstalled"
+      ;;
+    *) fail "hosts: print | blurb | install | uninstall" ;;
+  esac
+}
+
+# --- Forward lifecycle -------------------------------------------------------
+start_pf() {
+  # start_pf name address local_port remote_port ns svc pidfile
+  local name="$1" addr="$2" lp="$3" rp="$4" ns="$5" svc="$6" pidf="$7"
+  local klog="${pidf%.pid}.kubectl.log"
+
+  if [[ -f "$pidf" ]]; then
+    local old
+    old=$(cat "$pidf" 2>/dev/null || true)
+    if is_alive "$old" && port_open "$lp" "$addr"; then
+      ok "$name already up on ${addr}:${lp} (pid $old)"
+      return 0
+    fi
+    if is_alive "$old"; then
+      kill "$old" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$old" 2>/dev/null || true
+    fi
+    rm -f "$pidf"
+  fi
+
+  if port_open "$lp" "$addr"; then
+    warn "$name: ${addr}:${lp} already open (external); not reclaiming"
+    echo "external" >"$pidf"
+    return 0
+  fi
+
+  info "Starting $name: ${addr}:${lp} → ${ns}/${svc}:${rp}"
+  "${KUBECTL[@]}" port-forward -n "$ns" "$svc" --address "$addr" "${lp}:${rp}" \
+    >"$klog" 2>&1 &
+  local pid=$!
+  echo "$pid" >"$pidf"
+
+  local j
+  for j in $(seq 1 30); do
+    if port_open "$lp" "$addr"; then
+      ok "$name ready (pid $pid) ${addr}:${lp}"
+      log "started $name pid=$pid ${addr}:${lp}"
+      return 0
+    fi
+    if ! is_alive "$pid"; then
+      warn "$name died during start (see $klog)"
+      rm -f "$pidf"
+      return 1
+    fi
+    sleep 0.3
+  done
+  warn "$name: timeout waiting for ${addr}:${lp}"
+  return 1
+}
+
+stop_pf_file() {
+  local pidf="$1" label="$2"
+  [[ -f "$pidf" ]] || return 0
+  local old
+  old=$(cat "$pidf" 2>/dev/null || true)
+  if [[ "$old" == "external" ]]; then
+    info "$label external; not killing"
+    rm -f "$pidf"
+    return 0
+  fi
+  if is_alive "$old"; then
+    kill "$old" 2>/dev/null || true
+    sleep 0.15
+    kill -9 "$old" 2>/dev/null || true
+    ok "stopped $label (pid $old)"
+  fi
+  rm -f "$pidf"
+}
+
+start_one() {
+  local name="$1"
+  local i ns svc rp lp bip bp
+  i=$(index_of "$name") || fail "Unknown service: $name"
+  ns="${NS[$i]}"; svc="${SVC[$i]}"; rp="${REMOTE[$i]}"; lp="${LOCAL[$i]}"
+  bip="${BIND_IP[$i]}"; bp="${BIND_PORT[$i]}"
+
+  # Always maintain 127.0.0.1:local_port (Caddy / tools)
+  start_pf "$name" "127.0.0.1" "$lp" "$rp" "$ns" "$svc" "$(pid_file "$name")" || true
+
+  # Optional second forward on bind_ip:bind_port (requires aliases up)
+  if [[ "$CPF_BIND" == "1" && -n "$bip" && -n "$bp" ]]; then
+    if [[ "$bip" == "127.0.0.1" && "$bp" == "$lp" ]]; then
+      :
+    elif ! ip_usable "$bip"; then
+      warn "$name: skip bind ${bip}:${bp} (run: cluster-port-forward aliases up)"
+    else
+      start_pf "${name}-bind" "$bip" "$bp" "$rp" "$ns" "$svc" "$(pid_file2 "$name")" || true
+    fi
+  fi
+
+  printf 'name=%s\nns=%s\nsvc=%s\nremote=%s\nlocal=%s\nbind_ip=%s\nbind_port=%s\n' \
+    "$name" "$ns" "$svc" "$rp" "$lp" "$bip" "$bp" >"$(meta_file "$name")"
+}
+
+stop_one() {
+  local name="$1"
+  stop_pf_file "$(pid_file "$name")" "$name"
+  stop_pf_file "$(pid_file2 "$name")" "${name}-bind"
+  rm -f "$(meta_file "$name")" "$STATE_DIR/$name.kubectl.log" "$STATE_DIR/${name}-bind.kubectl.log" 2>/dev/null || true
+}
+
+ensure_one() {
+  local name="$1"
+  local i lp bip bp pidf old
+  i=$(index_of "$name") || return 1
+  lp="${LOCAL[$i]}"; bip="${BIND_IP[$i]}"; bp="${BIND_PORT[$i]}"
+  pidf=$(pid_file "$name")
+  old=""
+  [[ -f "$pidf" ]] && old=$(cat "$pidf" 2>/dev/null || true)
+
+  if is_alive "$old" && port_open "$lp" "127.0.0.1"; then
+    :
+  else
+    warn "$name: reconnect 127.0.0.1:${lp}"
+    log "reconnect $name loopback"
+    start_pf "$name" "127.0.0.1" "$lp" "${REMOTE[$i]}" "${NS[$i]}" "${SVC[$i]}" "$pidf" || true
+  fi
+
+  if [[ "$CPF_BIND" == "1" && -n "$bip" && -n "$bp" ]] && ip_usable "$bip"; then
+    local pidf2 old2
+    pidf2=$(pid_file2 "$name")
+    old2=""
+    [[ -f "$pidf2" ]] && old2=$(cat "$pidf2" 2>/dev/null || true)
+    if is_alive "$old2" && port_open "$bp" "$bip"; then
+      :
+    else
+      warn "$name: reconnect ${bip}:${bp}"
+      log "reconnect $name bind"
+      start_pf "${name}-bind" "$bip" "$bp" "${REMOTE[$i]}" "${NS[$i]}" "${SVC[$i]}" "$pidf2" || true
+    fi
+  fi
+}
+
+# --- Commands ----------------------------------------------------------------
+cmd_list() {
+  load_catalog
+  printf '%-16s %-12s %-32s %5s→%-5s  %-11s %s\n' \
+    "NAME" "NS" "SERVICE" "R" "L" "BIND" "PROFILES"
+  local i bip bp bind
+  for i in "${!NAME[@]}"; do
+    bip="${BIND_IP[$i]}"; bp="${BIND_PORT[$i]}"
+    if [[ -n "$bip" ]]; then bind="${bip}:${bp}"; else bind="-"; fi
+    printf '%-16s %-12s %-32s %5s→%-5s  %-11s %s\n' \
+      "${NAME[$i]}" "${NS[$i]}" "${SVC[$i]}" "${REMOTE[$i]}" "${LOCAL[$i]}" "$bind" "${PROFILES[$i]}"
+  done
+}
+
+cmd_status() {
+  load_catalog
+  printf '%-16s %-8s %-14s %-14s %s\n' "NAME" "PID" "LOOPBACK" "BIND" "STATE"
+  local i name lp bip bp pidf old state loopb bindst
+  for i in "${!NAME[@]}"; do
+    name="${NAME[$i]}"; lp="${LOCAL[$i]}"; bip="${BIND_IP[$i]}"; bp="${BIND_PORT[$i]}"
+    pidf=$(pid_file "$name")
+    old="-"; [[ -f "$pidf" ]] && old=$(cat "$pidf" 2>/dev/null || echo "-")
+    if port_open "$lp" "127.0.0.1"; then loopb=":${lp}"; else loopb="down"; fi
+    if [[ -n "$bip" && -n "$bp" ]] && port_open "$bp" "$bip"; then
+      bindst="${bip}:${bp}"
+    elif [[ -n "$bip" ]]; then
+      bindst="down"
+    else
+      bindst="-"
+    fi
+    if is_alive "$old" && port_open "$lp" "127.0.0.1"; then state="up"
+    elif port_open "$lp" "127.0.0.1"; then state="port-up"
+    elif [[ -n "$old" && "$old" != "-" ]]; then state="down"
+    else state="off"
+    fi
+    printf '%-16s %-8s %-14s %-14s %s\n' "$name" "$old" "$loopb" "$bindst" "$state"
+  done
+}
+
+cmd_start() {
+  load_catalog
+  local -a sel
+  read_lines sel < <(resolve_selection "$@")
+  [[ ${#sel[@]} -gt 0 ]] || fail "Nothing to start"
+  if [[ "$CPF_BIND" == "1" ]]; then
+    info "CPF_BIND=1 — will also bind catalog bind_ip:bind_port (run: aliases up first)"
+  fi
+  info "Starting ${#sel[@]} service(s): ${sel[*]}"
+  local n
+  for n in "${sel[@]}"; do start_one "$n" || true; done
+  printf '%s\n' "${sel[@]}" >"$STATE_DIR/selection.txt"
+  cmd_status
+}
+
+cmd_stop() {
+  load_catalog
+  local -a sel
+  if [[ $# -eq 0 || "${1:-}" == all ]]; then
+    if [[ -f "$STATE_DIR/selection.txt" ]]; then
+      read_lines sel <"$STATE_DIR/selection.txt"
+    else
+      read_lines sel < <(printf '%s\n' "${NAME[@]}")
+    fi
+  else
+    read_lines sel < <(resolve_selection "$@")
+  fi
+  local n
+  for n in "${sel[@]}"; do stop_one "$n" || true; done
+}
+
+cmd_watch() {
+  load_catalog
+  local -a sel
+  read_lines sel < <(resolve_selection "$@")
+  [[ ${#sel[@]} -gt 0 ]] || fail "Nothing to watch"
+  printf '%s\n' "${sel[@]}" >"$STATE_DIR/selection.txt"
+  info "Supervising ${#sel[@]} service(s); poll ${POLL_SEC}s (Ctrl-C stops)"
+  log "watch start: ${sel[*]}"
+
+  cleanup() {
+    echo
+    info "Stopping supervised forwards…"
+    local n
+    for n in "${sel[@]}"; do stop_one "$n" || true; done
+    exit 0
+  }
+  trap cleanup INT TERM EXIT
+
+  local n
+  for n in "${sel[@]}"; do start_one "$n" || true; done
+  while true; do
+    for n in "${sel[@]}"; do ensure_one "$n"; done
+    sleep "$POLL_SEC"
+  done
+}
+
+cmd_doctor() {
+  load_catalog
+  info "KUBECONFIG=$KUBECONFIG"
+  info "CATALOG=$CATALOG"
+  if ! "${KUBECTL[@]}" cluster-info >/dev/null 2>&1; then
+    fail "kubectl cannot reach cluster"
+  fi
+  ok "cluster reachable"
+  local i miss=0
+  for i in "${!NAME[@]}"; do
+    if "${KUBECTL[@]}" get -n "${NS[$i]}" "${SVC[$i]}" >/dev/null 2>&1; then
+      ok "${NAME[$i]}: ${NS[$i]}/${SVC[$i]}"
+    else
+      warn "${NAME[$i]}: missing ${NS[$i]}/${SVC[$i]}"
+      miss=$((miss + 1))
+    fi
+  done
+  [[ $miss -eq 0 ]] && ok "all catalog services present" || warn "$miss missing"
+  info "hosts source: ${HOSTS_SRC:-none}"
+  info "aliases: cluster-port-forward aliases status"
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    start)   cmd_start "$@" ;;
+    stop)    cmd_stop "$@" ;;
+    watch|supervise|daemon) cmd_watch "$@" ;;
+    status|st) cmd_status ;;
+    list|ls) cmd_list ;;
+    doctor|check) cmd_doctor ;;
+    hosts)   cmd_hosts "$@" ;;
+    aliases|alias) cmd_aliases "$@" ;;
+    -h|--help|help|"") usage 0 ;;
+    *) fail "Unknown command: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,36 @@
+# Noizu cluster port-forward catalog
+# Format (whitespace-separated):
+#   name  namespace  service  remote_port  local_port  profiles  [bind_ip]  [bind_port]
+#
+# local_port  = high port on 127.0.0.1 (always registered; used by Caddy Pattern A)
+# bind_ip     = optional lo0 alias (Pattern B); when set, also PF --address bind_ip:bind_port
+# bind_port   = port on bind_ip (default: remote_port for DBs, 80 for HTTP)
+#
+# Profiles: data, platform, infra, ai, apps, minio, all
+
+# --- Data tiers (Timescale / Valkey) ---
+# local high-ports for Caddy/tools; bind_ip:standard ports for app env (host=app-tsdb.dev port=5432)
+app-tsdb        apps      svc/app-timescaledb        5432   54330   data,apps,all       10.0.0.10  5432
+app-valkey      apps      svc/app-valkey              6379   56379   data,apps,all       10.0.0.11  6379
+platform-tsdb   platform  svc/platform-timescaledb   5432   54320   data,platform,all   10.0.0.12  5432
+platform-valkey platform  svc/platform-valkey        6379   56380   data,platform,all   10.0.0.13  6379
+infra-tsdb      infra     svc/infra-timescaledb      5432   54310   data,infra,all      10.0.0.14  5432
+infra-valkey    infra     svc/infra-valkey           6379   56381   data,infra,all      10.0.0.15  6379
+
+# --- Infra / secrets / TF state ---
+minio           infra     svc/minio-service          9000   9000    infra,minio,all     10.0.0.20  9000
+minio-console   infra     svc/minio-service          9001   9001    infra,minio,all     10.0.0.21  9001
+infisical       infra     svc/infisical              80     18080   infra,all           10.0.0.22  80
+
+# --- AI / vectors ---
+weaviate        platform-ai  svc/weaviate            80     18081   ai,all              10.0.0.41  80
+weaviate-grpc   platform-ai  svc/weaviate-grpc       50051  50051   ai,all              10.0.0.42  50051
+qdrant          platform-ai  svc/qdrant              6333   16333   ai,all              10.0.0.43  6333
+qdrant-grpc     platform-ai  svc/qdrant              6334   16334   ai,all              10.0.0.44  6334
+
+# --- App backends ---
+therobotplans   apps      svc/tobornalp-therobotplans  4000  14000  apps,all            10.0.0.60  80
+therobotplans-ui apps     svc/tobornalp-therobotplans  3000  13000  apps,all            10.0.0.61  80
+npl-mcp         apps      svc/npl-mcp                  4040  14040  apps,all            10.0.0.62  80
+npl-ui          apps      svc/npl-mcp                  3000  13040  apps,all            10.0.0.63  80
+therobotdrafts  apps      svc/therobotdrafts           4000  14041  apps,all            10.0.0.64  80
