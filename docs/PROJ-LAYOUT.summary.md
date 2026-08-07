@@ -14,7 +14,7 @@ port-forward-utils/
 │   ├── local-dev-hosts.md          # Pattern A/B design
 │   └── sudoers.d-noizu-local-dev   # NOPASSWD lo0 / tee (macOS)
 ├── docs/
-│   └── PROJ-LAYOUT.md · PROJ-LAYOUT.summary.md
+│   └── PROJ-ARCH · PROJ-LAYOUT (+ .summary companions)
 ├── Makefile                        # make install → ~/.local/bin + share
 └── README.md
 ```

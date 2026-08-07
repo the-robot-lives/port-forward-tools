@@ -20,8 +20,9 @@ port-forward-utils/
 │   ├── local-dev-hosts.md          #   Design notes (Pattern A/B, IP ranges)
 │   └── sudoers.d-noizu-local-dev   #   NOPASSWD ifconfig/tee digests (macOS)
 ├── docs/
+│   ├── PROJ-ARCH.md(+.summary)     #   Architecture + runtime model
 │   ├── PROJ-LAYOUT.md(+.summary)   #   This file + tree-only companion
-│   └── (no PROJ-ARCH / HOWTO yet)
+│   └── (no PROJ-HOWTO / FAQ yet)
 ├── Makefile                        # install | test (bash -n) | doctor
 └── README.md                       # Start here — usage, profiles, ports, env
 ```
