@@ -212,5 +212,6 @@ dev loop.
 ## Related docs
 
 - Layout tree: [PROJ-LAYOUT.md](PROJ-LAYOUT.md)
+- Config/state artifact schema: [PROJ-SCHEMA.md](PROJ-SCHEMA.md)
 - Operator usage: [../README.md](../README.md)
 - Local hostname design: [../share/local-dev-hosts.md](../share/local-dev-hosts.md)
