@@ -85,7 +85,7 @@ Example row:
 app-tsdb  apps  svc/app-timescaledb  5432  54330  data,apps,all  10.0.0.10  5432
 ```
 
-Current catalog: **20 services** across namespaces `apps`, `platform`,
+Current catalog: **18 services** across namespaces `apps`, `platform`,
 `infra`, `platform-ai`. Profile semantics: a selection token matches a service
 when its `profiles` list contains the token (or token = `all`). Address plan:
 `10.0.0.1` edge, `.10–15` data, `.20–22` infra, `.41–44` AI, `.60–64` apps.
@@ -158,7 +158,7 @@ Source lines: `IP  hostname [alias…]` — every name dual-written as `*.dev` a
 ## 6. sudoers template — `share/sudoers.d-noizu-local-dev`
 
 macOS-only. Grants NOPASSWD for exactly three command classes, each sha256
-digest-pinned: `ifconfig lo0 ±alias <ip> netmask 255.255.255.0` for the 20
+digest-pinned: `ifconfig lo0 ±alias <ip> netmask 255.255.255.0` for the 19
 catalog alias IPs (`NOIZU_IFCONFIG_ALIAS` / `_UNALIAS`), and `/usr/bin/tee
 /etc/hosts` (`NOIZU_HOSTS_TEE`). Digests must be regenerated after OS updates
 (`shasum -a 256 /sbin/ifconfig /usr/bin/tee /bin/cp`); user placeholder
