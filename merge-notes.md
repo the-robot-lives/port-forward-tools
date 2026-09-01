@@ -22,4 +22,4 @@ Pruned merged branches: 0.
 
 ## Open PRs
 none
-- Dual checkout: made in this checkout (/Users/keithbrings/Work/Space/Noizu/Portfolio/Utilities/source/port-forward-utils); twin checkout `utilities/database/database-utils` shares the remote and was NOT touched.
+- Dual checkout: made in this checkout; twin checkout `utilities/k8/port-forward-utils` shares the remote and was NOT touched.
