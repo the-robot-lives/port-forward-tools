@@ -1,123 +1,41 @@
-# cluster-port-forward
+# port-forward-utils
 
-Keep `kubectl port-forward` tunnels **up** for local tests against cluster
-(prod-like) data: Timescale, Valkey, Weaviate, MinIO, Infisical, app backends.
+**Repo:** https://github.com/the-robot-lives/port-forward-tools
 
-On disconnect the **watch** supervisor restarts each forward.
+Keep `kubectl port-forward` tunnels up for local tests against cluster data (Timescale, Valkey, Weaviate, MinIO, Infisical, app backends).
 
-## Install
+## What
+
+`cluster-port-forward` — a catalog-driven port-forward manager with a watch supervisor that restarts forwards on disconnect.
+
+## Why
+
+Local integration tests need prod-like data services that aren't exposed publicly. Ad-hoc `kubectl port-forward` invocations die silently and don't compose; this tool keeps a declared set of tunnels (with stable local ports) alive and observable.
+
+## Getting Started
+
+Prerequisites: `kubectl`, `nc` (or bash `/dev/tcp`), `KUBECONFIG` (defaults to `~/.kube/noizu/config`).
 
 ```bash
-cd utilities/k8/port-forward-utils
-make install          # → ~/.local/bin/cluster-port-forward
+make install    # → ~/.local/bin/cluster-port-forward  (make test / make doctor also available)
 ```
 
-Requires: `kubectl`, `nc` (or bash `/dev/tcp`), `KUBECONFIG` (defaults to
-`~/.kube/noizu/config`).
-
-## Usage
-
 ```bash
-# Check catalog services exist on the cluster
-cluster-port-forward doctor
-
-# List catalog (name, ns, ports, profiles)
-cluster-port-forward list
-
-# One-shot start (no supervisor)
-cluster-port-forward start data          # app/platform/infra TSDB + Valkey
-cluster-port-forward start data ai       # + weaviate/qdrant
-cluster-port-forward start all
-
-# Supervise (recommended): re-link on disconnect  [Ctrl-C stops]
-cluster-port-forward watch data ai minio
-
-# Status / stop
+cluster-port-forward doctor                 # check catalog services exist on the cluster
+cluster-port-forward list                   # list catalog (name, ns, ports, profiles)
+cluster-port-forward start data [ai ...]    # one-shot start, no supervisor
+cluster-port-forward watch data ai minio    # supervise: re-link on disconnect [Ctrl-C stops]
 cluster-port-forward status
-cluster-port-forward stop
-cluster-port-forward stop weaviate
+cluster-port-forward stop [weaviate]
 ```
 
-### Profiles
+Profiles: `data` (app/platform/infra TSDB + Valkey), `ai` (weaviate, weaviate-grpc, qdrant), `infra` (minio, minio-console, infisical, infra tsdb/valkey), `platform`, `apps` (tsdb/valkey + therobotplans / npl-mcp / drafts backends), `minio`, `all`.
 
-| Profile    | Services |
-|------------|----------|
-| `data`     | app/platform/infra timescaledb + valkey |
-| `ai`       | weaviate, weaviate-grpc, qdrant |
-| `infra`    | minio, minio-console, infisical, infra tsdb/valkey |
-| `platform` | platform tsdb/valkey |
-| `apps`     | app tsdb/valkey + therobotplans / npl-mcp / drafts backends |
-| `minio`    | minio API + console |
-| `all`      | everything in the catalog |
+## How It Works
 
-### Local ports (defaults)
+- **Catalog**: `share/port-forwards.catalog` (or `$CPF_CATALOG`) declares services — namespace, remote ports, local ports, profile membership. Edit it to add targets.
+- **Stable local ports** (defaults): app-timescaledb 54330, platform 54320, infra 54310; valkey 56379-56381; minio 9000/9001; infisical 18080; weaviate 18081 (grpc 50051); qdrant 16333/16334; therobotplans 14000; npl-mcp 14040.
+- **Supervision**: `watch` polls each tunnel (`CPF_POLL_SEC`, default 3s) and restarts forwards that drop; state lives under `$XDG_RUNTIME_DIR/noizu-port-forwards` (or `/tmp`).
+- **Env**: `KUBECONFIG`, `KUBE_CONTEXT`, `CPF_STATE_DIR`, `CPF_POLL_SEC`.
 
-| Service | Local |
-|---------|-------|
-| app-timescaledb | **54330** |
-| platform-timescaledb | **54320** |
-| infra-timescaledb | **54310** |
-| app-valkey | **56379** |
-| platform-valkey | **56380** |
-| infra-valkey | **56381** |
-| minio | **9000** / console **9001** |
-| infisical | **18080** |
-| weaviate | **18081** |
-| weaviate-grpc | **50051** |
-| qdrant | **16333** / grpc **16334** |
-| therobotplans API | **14000** |
-| npl-mcp | **14040** |
-
-Edit `share/port-forwards.catalog` (or `$CPF_CATALOG`) to add targets.
-
-## Env
-
-| Variable | Default |
-|----------|---------|
-| `KUBECONFIG` | `~/.kube/noizu/config` |
-| `KUBE_CONTEXT` | (kubectl default) |
-| `CPF_STATE_DIR` | `$XDG_RUNTIME_DIR/noizu-port-forwards` or `/tmp/...` |
-| `CPF_POLL_SEC` | `3` |
-| `CPF_CATALOG` | installed share path |
-
-## Example: local tests against cluster data
-
-```bash
-# Terminal 1 — keep tunnels alive
-cluster-port-forward watch data ai
-
-# Terminal 2 — point app at forwarded endpoints
-export DATABASE_URL=ecto://USER:PASS@127.0.0.1:54330/therobotplans
-export REDIS_URL=redis://127.0.0.1:56379
-export WEAVIATE_URL=http://127.0.0.1:18081
-mix test
-```
-
-Credentials still come from Infisical / k8s secrets / `dc` — this tool only
-forwards ports.
-
-## Clean hostnames (no port in URLs)
-
-See **[share/local-dev-hosts.md](share/local-dev-hosts.md)** for the proposal:
-
-- Static **`10.0.0.0/24`** loopback aliases + `/etc/hosts` (`*.dev`)
-- Or **Caddy on :80** Host-routing to forwarded ports
-- Ready-to-paste: `share/hosts.local-dev`, `share/Caddyfile.local-dev`
-
-```bash
-# tunnels
-cluster-port-forward watch data ai apps
-
-# optional HTTP edge (no :port in browser)
-sudo caddy run --config share/Caddyfile.local-dev
-# → http://weaviate.dev  http://therobotplans.dev  http://infisical.dev
-```
-
-## Notes
-
-- If a local port is already open, the tool **does not steal it** (marks
-  `external`). Free the port or change the catalog local port.
-- Logs: `$CPF_STATE_DIR/<name>.kubectl.log` and `supervisor.log`.
-- Not a replacement for `liquibase-shell` (which still does its own short-lived
-  PF + secret fetch for migrations).
-
+Docs: `docs/` (PROJ-ARCH, PROJ-LAYOUT, PROJ-SCHEMA).
