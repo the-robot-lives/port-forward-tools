@@ -22,9 +22,11 @@ port-forward-utils/
 ├── docs/
 │   ├── PROJ-ARCH.md(+.summary)     #   Architecture + runtime model
 │   ├── PROJ-LAYOUT.md(+.summary)   #   This file + tree-only companion
+│   ├── PROJ-SCHEMA.md(+.summary)   #   Config/state artifact schema (no DB)
 │   └── (no PROJ-HOWTO / FAQ yet)
 ├── Makefile                        # install | test (bash -n) | doctor
-└── README.md                       # Start here — usage, profiles, ports, env
+├── README.md                       # Start here — usage, profiles, ports, env
+└── merge-notes.md                  # Branch-sweep/merge history notes (sep-1)
 ```
 
 ## Install mapping (`make install`)
