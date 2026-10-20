@@ -1,2 +1,2 @@
-NAME                            PHASE
-platform-valkey-d5bd8bfbc-986sr Running
+NAME                          PHASE
+platform-valkey-fff1         Running

@@ -658,14 +658,17 @@ catalog_local_for() {
 }
 
 # --- Tunnel profiles: pod enumeration ----------------------------------------
+# kubectl jsonpath renders map fields either as JSON {"k":"v"} or Go map[k:v];
+# both must normalize to label-selector form k=v (label keys/values cannot
+# contain ':', so s/:/=/g is unambiguous).
 tw_svc_selector() { # ns name → k=v,k2=v2 (empty on error)
   "${TW_KUBECTL[@]}" -n "$1" get svc "$2" -o jsonpath='{.spec.selector}' 2>/dev/null \
-    | sed -e 's/^[[:space:]]*//' -e 's/[{}]//g' -e 's/"//g' -e 's/[[:space:]]*$//'
+    | sed -e 's/^[[:space:]]*//' -e 's/[{}]//g' -e 's/"//g' -e 's/^map\[//' -e 's/\]$//' -e 's/:/=/g' -e 's/[[:space:]]*$//'
 }
 
 tw_deploy_selector() {
   "${TW_KUBECTL[@]}" -n "$1" get deploy "$2" -o jsonpath='{.spec.selector.matchLabels}' 2>/dev/null \
-    | sed -e 's/^[[:space:]]*//' -e 's/[{}]//g' -e 's/"//g' -e 's/[[:space:]]*$//'
+    | sed -e 's/^[[:space:]]*//' -e 's/[{}]//g' -e 's/"//g' -e 's/^map\[//' -e 's/\]$//' -e 's/:/=/g' -e 's/[[:space:]]*$//'
 }
 
 tw_list_pods() { # ns kind name → pod names, oldest → newest (n=1..N)

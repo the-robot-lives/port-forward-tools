@@ -179,6 +179,30 @@ assert_contains "raw catalog ports" "$out" "svc/app-valkey --address 127.0.0.1 5
 out=$(cpf up --dry-run --include weaviate/platform-ai:9999 2>/dev/null)
 assert_contains "raw port override" "$out" "svc/weaviate --address 127.0.0.1 9999:80"
 
+# --- 4b. regression: REAL kubectl shapes (post-merge smoke defect) -------------
+# Real kubectl renders {.spec.selector} as JSON {"k":"v"}; the tool must
+# normalize it to k=v (a k:v selector is an API BadRequest). The fake kubectl
+# now rejects non-k=v selectors like the real API, and pods fixtures carry the
+# real custom-columns shape (aligned NAME/PHASE header + PHASE column).
+
+# the fixture double must be honest about selector shape (guards the sed fix)
+err=$("$FIX/kubectl" --context noizu -n apps get pods -l "app.kubernetes.io/name:app-valkey" -o custom-columns=NAME:.metadata.name 2>&1 >/dev/null); rc=$?
+assert_rc "fake rejects k:v selector rc" 1 "$rc"
+assert_contains "fake rejects k:v selector err" "$err" "BadRequest"
+
+# bare slug = default row + ALL instance rows (symptom-3 guard)
+out=$(cpf up --dry-run --json --include valkey 2>/dev/null)
+assert_contains "bare slug keeps default 6308" "$out" '"local_port":6308'
+assert_contains "bare slug adds instance n1 6314" "$out" '"local_port":6314'
+
+# n=1 resolution against the verbatim live-captured fixture (real pod name)
+out=$(FAKE_PODS_SUFFIX=_live cpf up --dry-run --json --include valkey-oldest 2>/dev/null); rc=$?
+assert_rc "live-shape enumeration rc" 0 "$rc"
+assert_contains "live-shape real pod name" "$out" '"pod":"app-valkey-6c986598d6-7pxf9"'
+assert_contains "live-shape owner math 6314" "$out" '"local_port":6314'
+out=$(FAKE_PODS_SUFFIX=_live cpf up --dry-run --include valkey-oldest 2>/dev/null)
+assert_contains "live-shape argv" "$out" "pod/app-valkey-6c986598d6-7pxf9 --address 127.0.0.1 6314:6379"
+
 # --- 5. missing-port refusals --------------------------------------------------
 err=$(cpf up --dry-run --profile "$FIX/profiles/no-port.yaml" 2>&1 >/dev/null); rc=$?
 assert_rc "no-port refusal rc" 1 "$rc"

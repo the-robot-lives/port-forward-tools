@@ -67,16 +67,30 @@ case "$SUB" in
       echo '{}'; exit 0
     fi
     if has_flag "pods" "$@"; then
+      # mirror real kubectl: a -l selector must be k=v form; k:v (the classic
+      # jsonpath-map bug) is a BadRequest — this keeps the fixture honest about
+      # selector shape so the tool's selector normalization is actually tested.
+      prev=""
+      for a in "$@"; do
+        if [[ "$prev" == "-l" ]]; then
+          if [[ "$a" != *"="* ]]; then
+            echo "Error from server (BadRequest): Unable to parse requirement: Invalid value: \"$a\": name part must consist of alphanumeric characters, '-', '_' or '.' (did you forget k=v?)" >&2
+            exit 1
+          fi
+          break
+        fi
+        prev="$a"
+      done
       # `get pods <name> -o custom-columns=...` (single pod)
       prev=""
       for a in "$@"; do
-        if [[ "$prev" == "pods" && "$a" != -* && "$a" != custom-columns* ]]; then
+        if [[ "$prev" == "pods" && "$a" != -* && "$a" != custom-columns* && "$a" != "$NS" ]]; then
           printf 'NAME\n%s\n' "$a"
           exit 0
         fi
         prev="$a"
       done
-      f="$FIX/pods_${NS}.txt"
+      f="$FIX/pods_${NS}${FAKE_PODS_SUFFIX:-}.txt"
       if [[ -f "$f" ]]; then cat "$f"; exit 0; fi
       printf 'NAME\n'
       exit 0
