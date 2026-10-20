@@ -57,4 +57,5 @@ cluster-port-forward tui                             # ANSI table: j/k move, ent
 - **Multi-instance**: endpoints with `instances: true` enumerate pods oldest→newest via the svc selector; instance n gets local port `default_port + 2n + 4` (6308 → 6314, 6316, …). Plan-time overlap: defaults win, colliding instance rows are dropped with a 🔥 warning (keep ≥20-port gaps between endpoints).
 - **Reverse (local→cluster) tunnels**: endpoints with `direction: l2k` run `ssh -N -R *:<remote_port>:127.0.0.1:<local_port>` (autossh when available) against `ssh_host`; health is an `nc` probe of the node IP.
 - **Env**: `TUNNEL_WATCHER_PROFILE`, `TUNNEL_WATCHER_DIR` (config dir, default `~/.config/tunnel-watcher`); `up` flags: `--timeout 30s|5m|1h`, `--json`, `--dry-run`, `--watch`, `--tui`.
+- **Flag position**: flags go after the subcommand (`cluster-port-forward tui --profile noizu`, not `--profile noizu tui` — the latter fails with a hint). `tui --profile P` and `status --profile P` honor the flag the same way `up` does; `status --profile P` filters the profile-tunnel section to that profile's slugs, and the section always renders (naming the state dir when empty).
 
