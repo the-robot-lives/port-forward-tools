@@ -1,0 +1,2 @@
+NAME                            PHASE
+platform-valkey-d5bd8bfbc-986sr Running

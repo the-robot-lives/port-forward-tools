@@ -1,0 +1,5 @@
+profile: noport
+endpoints:
+  - slug: orphan
+    namespace: apps
+    service: app-valkey

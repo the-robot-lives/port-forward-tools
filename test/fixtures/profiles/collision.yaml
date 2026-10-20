@@ -1,0 +1,12 @@
+profile: coll
+ssh_host: noizu.server
+endpoints:
+  - slug: alpha
+    namespace: apps
+    service: app-valkey
+    default_port: 7000
+  - slug: beta
+    namespace: apps
+    service: app-valkey
+    default_port: 6990
+    instances: true

@@ -1,0 +1,37 @@
+# tunnel-watcher profile — noizu (starter template)
+# Installed by `make install` to ~/.config/tunnel-watcher/noizu.yaml (only if absent).
+# Parser subset: top-level `key: value`, one `endpoints:` list of `- key: value`
+# items (2-space `- `, 4-space continuation), bare scalars, `#` comments.
+# Anything else fails loudly with a line number.
+#
+# k2l (default): cluster service/pod → local loopback port.
+#   Per-instance local port = default_port + 2n + 4 (n = 1..N, oldest pod first),
+#   e.g. base 6308 → n1 6314 … n5 6322.
+# l2k (direction: l2k): local service → cluster; binds *:remote_port on ssh_host.
+#   Keep ≥20 ports of spacing between endpoints (authoring guidance; doctor warns).
+#   Pods can only reach a reverse port when sshd on ssh_host has
+#   GatewayPorts clientspecified (doctor checks).
+
+profile: noizu
+ssh_host: noizu.server            # used by direction: l2k endpoints
+
+endpoints:
+  - slug: valkey
+    namespace: apps
+    service: app-valkey
+    kind: service                  # service | pod | deployment
+    default_port: 6308             # even; k2l local port AND multi-instance base
+    instances: true                # per-instance ports, see header
+    default_instance: latest       # latest | oldest | num-N | first
+
+  - slug: platform-valkey
+    namespace: platform
+    service: platform-valkey
+    default_port: 6360
+
+  # local → cluster (reverse): binds *:6001 on ssh_host; cluster side reaches it
+  # at <node-ip>:6001 (port spacing 6308…6360 → 6987 demonstrates the ≥20 gap).
+  # - slug: timescale-local
+  #   direction: l2k
+  #   local_port: 6987               # local service port
+  #   remote_port: 6001              # odd; binds on ssh_host

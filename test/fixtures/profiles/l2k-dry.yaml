@@ -1,0 +1,7 @@
+profile: l2kdry
+ssh_host: noizu.server
+endpoints:
+  - slug: timescale-local
+    direction: l2k
+    local_port: 6987
+    remote_port: 6001

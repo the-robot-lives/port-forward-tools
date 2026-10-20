@@ -1,0 +1,7 @@
+profile: l2klive
+ssh_host: 127.0.0.1
+endpoints:
+  - slug: rev
+    direction: l2k
+    local_port: 60998
+    remote_port: 60999

@@ -7,6 +7,9 @@
 # Usage:
 #   cluster-port-forward start [profile|name ...]   # default: data
 #   cluster-port-forward watch [profile|name ...]   # start + supervise (foreground)
+#   cluster-port-forward up [--profile P] [--include spec ...] [--timeout 30s]
+#                           [--json] [--dry-run] [--watch] [--tui]
+#   cluster-port-forward tui                        # tunnel dashboard (TTY; degrades to status)
 #   cluster-port-forward stop  [name|all]
 #   cluster-port-forward status
 #   cluster-port-forward list
@@ -14,17 +17,22 @@
 #   cluster-port-forward hosts print|install|uninstall
 #   cluster-port-forward aliases up|down|status
 #
-# Profiles: data | platform | infra | ai | apps | minio | all
+# Catalog profiles: data | platform | infra | ai | apps | minio | all
+# Tunnel profiles:  YAML in ~/.config/tunnel-watcher/<name>.yaml (--profile / $TUNNEL_WATCHER_PROFILE)
+#   include specs:  slug | slug-oldest | slug-latest | slug-num-N | slug-default
+#                   slug[:PORT] | slug-oldest[:PORT] | name/namespace[:PORT]
 #
 # Env:
 #   KUBECONFIG          default: ~/.kube/noizu/config
-#   KUBE_CONTEXT        optional kubectl --context
+#   KUBE_CONTEXT        optional kubectl --context (tunnel paths default context: noizu)
 #   CPF_STATE_DIR       default: ${XDG_RUNTIME_DIR:-/tmp}/noizu-port-forwards
 #   CPF_CATALOG         override catalog path
 #   CPF_HOSTS_FILE      hosts block source (default: share/hosts.local-dev)
 #   CPF_BIND            1 (default) also PF to bind_ip:bind_port when catalog has them
 #   CPF_POLL_SEC        supervisor poll interval (default 3)
 #   CPF_LOG             log file
+#   TUNNEL_WATCHER_PROFILE      default tunnel profile (name or path) for up/tui
+#   TUNNEL_WATCHER_DIR          tunnel profile dir (default ~/.config/tunnel-watcher)
 #
 set -euo pipefail
 
@@ -67,6 +75,12 @@ if [[ -n "${KUBE_CONTEXT:-}" ]]; then
   KUBECTL+=(--context "$KUBE_CONTEXT")
 fi
 
+# --- Tunnel profiles (up/tui) -------------------------------------------------
+TW_CONFIG_DIR="${TUNNEL_WATCHER_DIR:-$HOME/.config/tunnel-watcher}"
+TW_DEFAULT_SSH_HOST="noizu.server"
+TW_CONTEXT="${KUBE_CONTEXT:-noizu}"  # --context used by profile/tunnel paths only
+TW_KUBECTL=(kubectl --context "$TW_CONTEXT")
+
 mkdir -p "$STATE_DIR"
 
 info()  { echo "→ $*"; }
@@ -85,8 +99,8 @@ read_lines() {
 }
 
 usage() {
-  # Header comments only (lines 2–28); avoid bleeding into live code
-  sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+  # Header comments only (lines 2–37); avoid bleeding into live code
+  sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -440,7 +454,1009 @@ ensure_one() {
   fi
 }
 
-# --- Commands ----------------------------------------------------------------
+# --- Tunnel profiles: parser --------------------------------------------------
+# Fixed YAML subset: top-level `key: value`, one list (`endpoints:`) of
+# `- key: value` items (2-space `- `, 4-space continuation), bare scalars,
+# `#` comments. Anything else = hard error naming the line. No python/yq.
+PF_PROFILE=""; PF_SSH_HOST=""; PF_FILE=""
+declare -a EP_SLUG EP_NS EP_SVC EP_KIND EP_DIR EP_DEFAULT_PORT EP_INSTANCES EP_DEFAULT_INSTANCE EP_LOCAL_PORT EP_REMOTE_PORT
+
+pf_parse() {
+  PF_FILE="$1"
+  [[ -f "$PF_FILE" ]] || fail "Profile not found: $PF_FILE"
+  local out rc=0 line idx key val e
+  out=$(awk '
+    function err(m) { printf "profile error, line %d: %s\n", NR, m > "/dev/stderr"; exit 3 }
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    function scalar(v, k) {
+      if (v ~ /^[\[{]/) err("flow style not supported for key '"'"'" k "'"'"': " v)
+      if (v ~ /^["'"'"']/) err("quoted scalars not supported for key '"'"'" k "'"'"': " v)
+      return v
+    }
+    function emit(item,   k, v) {
+      if (item !~ /^[A-Za-z_][A-Za-z0-9_]*:/) err("bad list item (want '"'"'key: value'"'"')")
+      k = substr(item, 1, index(item, ":") - 1)
+      v = trim(substr(item, length(k) + 2))
+      if (k != "slug" && k != "namespace" && k != "service" && k != "kind" && \
+          k != "direction" && k != "default_port" && k != "instances" && \
+          k != "default_instance" && k != "local_port" && k != "remote_port")
+        err("unknown endpoint key: " k)
+      if (v == "") err("missing value for endpoint key: " k)
+      printf "E|%d|%s|%s\n", epi, k, scalar(v, k)
+    }
+    BEGIN { inlist = 0; epi = 0 }
+    {
+      line = $0
+      sub(/#.*/, "", line)
+      sub(/[ \t]+$/, "", line)
+      if (line == "") next
+      if (line ~ /^[A-Za-z_][A-Za-z0-9_]*:/) {
+        if (inlist) err("top-level key inside endpoints list")
+        k = substr(line, 1, index(line, ":") - 1)
+        v = trim(substr(line, length(k) + 2))
+        if (k != "profile" && k != "ssh_host" && k != "endpoints") err("unknown key: " k)
+        if (seen_top[k]++) err("duplicate key: " k)
+        if (k == "endpoints") {
+          if (v != "") err("endpoints: takes a list, not a value")
+          inlist = 1
+        } else {
+          if (v == "") err("missing value for key: " k)
+          printf "T|%s|%s\n", k, scalar(v, k)
+        }
+        next
+      }
+      if (line ~ /^  - /) {
+        if (!inlist) err("list item outside endpoints:")
+        epi++
+        emit(substr(line, 5))
+        next
+      }
+      if (line ~ /^    [A-Za-z_][A-Za-z0-9_]*:/) {
+        if (!inlist) err("indented key outside endpoints:")
+        if (epi == 0) err("continuation before first list item")
+        emit(substr(line, 5))
+        next
+      }
+      err("unsupported syntax (subset: '"'"'key: value'"'"', '"'"'  - key: value'"'"', '"'"'    key: value'"'"')")
+    }
+  ' "$PF_FILE") || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    fail "could not parse profile: $PF_FILE"
+  fi
+
+  PF_PROFILE=""; PF_SSH_HOST=""
+  EP_SLUG=(); EP_NS=(); EP_SVC=(); EP_KIND=(); EP_DIR=()
+  EP_DEFAULT_PORT=(); EP_INSTANCES=(); EP_DEFAULT_INSTANCE=()
+  EP_LOCAL_PORT=(); EP_REMOTE_PORT=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      T\|*)
+        key="${line#T|}"; val="${key#*|}"; key="${key%%|*}"
+        case "$key" in
+          profile)  PF_PROFILE="$val" ;;
+          ssh_host) PF_SSH_HOST="$val" ;;
+        esac
+        ;;
+      E\|*)
+        idx="${line#E|}"; e="${idx%%|*}"; e=$((e - 1))
+        rest="${idx#*|}"; key="${rest%%|*}"; val="${rest#*|}"
+        case "$key" in
+          slug)             EP_SLUG[$e]="$val" ;;
+          namespace)        EP_NS[$e]="$val" ;;
+          service)          EP_SVC[$e]="$val" ;;
+          kind)             EP_KIND[$e]="$val" ;;
+          direction)        EP_DIR[$e]="$val" ;;
+          default_port)     EP_DEFAULT_PORT[$e]="$val" ;;
+          instances)        EP_INSTANCES[$e]="$val" ;;
+          default_instance) EP_DEFAULT_INSTANCE[$e]="$val" ;;
+          local_port)       EP_LOCAL_PORT[$e]="$val" ;;
+          remote_port)      EP_REMOTE_PORT[$e]="$val" ;;
+        esac
+        ;;
+    esac
+  done <<<"$out"
+
+  [[ -n "$PF_PROFILE" ]] || PF_PROFILE="$(basename "${PF_FILE%.yaml}")"
+  PF_SSH_HOST="${PF_SSH_HOST:-$TW_DEFAULT_SSH_HOST}"
+  local i
+  for i in "${!EP_SLUG[@]}"; do
+    [[ -n "${EP_SLUG[$i]:-}" ]] || fail "profile $PF_FILE: endpoint $((i + 1)): missing slug"
+    EP_DIR[$i]="${EP_DIR[$i]:-k2l}"
+    case "${EP_DIR[$i]}" in
+      k2l|l2k) ;;
+      *) fail "profile $PF_FILE: ${EP_SLUG[$i]}: bad direction '${EP_DIR[$i]}' (k2l|l2k)" ;;
+    esac
+    if [[ "${EP_DIR[$i]}" == l2k ]]; then
+      [[ -n "${EP_LOCAL_PORT[$i]:-}" && -n "${EP_REMOTE_PORT[$i]:-}" ]] \
+        || fail "profile $PF_FILE: ${EP_SLUG[$i]}: l2k needs local_port and remote_port"
+      is_port "${EP_LOCAL_PORT[$i]}" || fail "profile $PF_FILE: ${EP_SLUG[$i]}: bad local_port"
+      is_port "${EP_REMOTE_PORT[$i]}" || fail "profile $PF_FILE: ${EP_SLUG[$i]}: bad remote_port"
+      [[ -z "${EP_DEFAULT_PORT[$i]:-}" ]] || fail "profile $PF_FILE: ${EP_SLUG[$i]}: l2k must not set default_port"
+    else
+      [[ -n "${EP_NS[$i]:-}" ]] || fail "profile $PF_FILE: ${EP_SLUG[$i]}: missing namespace"
+      [[ -n "${EP_SVC[$i]:-}" ]] || fail "profile $PF_FILE: ${EP_SLUG[$i]}: missing service"
+      [[ -z "${EP_LOCAL_PORT[$i]:-}" && -z "${EP_REMOTE_PORT[$i]:-}" ]] \
+        || fail "profile $PF_FILE: ${EP_SLUG[$i]}: k2l uses default_port; local_port/remote_port are l2k-only"
+      EP_KIND[$i]="${EP_KIND[$i]:-service}"
+      case "${EP_KIND[$i]}" in service|pod|deployment) ;; *) fail "profile $PF_FILE: ${EP_SLUG[$i]}: bad kind '${EP_KIND[$i]}'" ;; esac
+      EP_INSTANCES[$i]="${EP_INSTANCES[$i]:-false}"
+      case "${EP_INSTANCES[$i]}" in true|false) ;; *) fail "profile $PF_FILE: ${EP_SLUG[$i]}: instances must be true|false" ;; esac
+      EP_DEFAULT_INSTANCE[$i]="${EP_DEFAULT_INSTANCE[$i]:-first}"
+      [[ "${EP_DEFAULT_INSTANCE[$i]}" =~ ^(latest|oldest|first|num-[0-9]+)$ ]] \
+        || fail "profile $PF_FILE: ${EP_SLUG[$i]}: bad default_instance '${EP_DEFAULT_INSTANCE[$i]}'"
+      [[ -z "${EP_DEFAULT_PORT[$i]:-}" ]] || is_port "${EP_DEFAULT_PORT[$i]}" \
+        || fail "profile $PF_FILE: ${EP_SLUG[$i]}: bad default_port"
+    fi
+  done
+  return 0
+}
+
+pf_resolve_profile() {
+  local arg="$1" p
+  [[ -n "$arg" ]] || fail "no profile given: pass --profile <name|path> or set TUNNEL_WATCHER_PROFILE"
+  if [[ "$arg" == */* ]]; then
+    p="${arg/#\~/$HOME}"
+    [[ -f "$p" ]] || fail "profile not found: $p"
+    echo "$p"
+    return 0
+  fi
+  if [[ "$arg" == *.yaml ]]; then
+    [[ -f "$arg" ]] || fail "profile not found: $arg"
+    echo "$arg"
+    return 0
+  fi
+  local -a tried=("$TW_CONFIG_DIR/$arg.yaml" "./$arg.yaml")
+  for p in "${tried[@]}"; do
+    [[ -f "$p" ]] && { echo "$p"; return 0; }
+  done
+  fail "profile '$arg' not found (tried: ${tried[*]})"
+}
+
+pf_endpoint_index() {
+  local i
+  for i in "${!EP_SLUG[@]}"; do
+    [[ "${EP_SLUG[$i]}" == "$1" ]] && { echo "$i"; return 0; }
+  done
+  echo "unknown endpoint: $1 (profile endpoints: ${EP_SLUG[*]:-none})" >&2
+  return 1
+}
+
+is_port() { [[ "$1" =~ ^[0-9]+$ && "$1" -ge 1 && "$1" -le 65535 ]]; }
+
+parse_duration() { # 30 | 30s | 5m | 1h → seconds
+  local s="$1"
+  [[ "$s" =~ ^([0-9]+)([smh]?)$ ]] || fail "bad --timeout '$s' (accepts 30, 30s, 5m, 1h)"
+  local n="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]:-s}"
+  case "$u" in
+    s) echo "$n" ;;
+    m) echo $((n * 60)) ;;
+    h) echo $((n * 3600)) ;;
+  esac
+}
+
+# --- Tunnel profiles: catalog lookups (remote/local port by svc or name) ------
+tw_load_catalog() {
+  [[ -n "$CATALOG" && -f "$CATALOG" ]] || return 0
+  load_catalog
+}
+
+catalog_remote_for() {
+  local want="${1#svc/}" i
+  for i in "${!NAME[@]}"; do
+    if [[ "${SVC[$i]}" == "$want" || "${NAME[$i]}" == "$want" ]]; then echo "${REMOTE[$i]}"; return 0; fi
+  done
+  return 1
+}
+
+catalog_local_for() {
+  local want="${1#svc/}" i
+  for i in "${!NAME[@]}"; do
+    if [[ "${SVC[$i]}" == "$want" || "${NAME[$i]}" == "$want" ]]; then echo "${LOCAL[$i]}"; return 0; fi
+  done
+  return 1
+}
+
+# --- Tunnel profiles: pod enumeration ----------------------------------------
+tw_svc_selector() { # ns name → k=v,k2=v2 (empty on error)
+  "${TW_KUBECTL[@]}" -n "$1" get svc "$2" -o jsonpath='{.spec.selector}' 2>/dev/null \
+    | sed -e 's/^[[:space:]]*//' -e 's/[{}]//g' -e 's/"//g' -e 's/[[:space:]]*$//'
+}
+
+tw_deploy_selector() {
+  "${TW_KUBECTL[@]}" -n "$1" get deploy "$2" -o jsonpath='{.spec.selector.matchLabels}' 2>/dev/null \
+    | sed -e 's/^[[:space:]]*//' -e 's/[{}]//g' -e 's/"//g' -e 's/[[:space:]]*$//'
+}
+
+tw_list_pods() { # ns kind name → pod names, oldest → newest (n=1..N)
+  local ns="$1" kind="$2" name="$3" sel=""
+  case "$kind" in
+    pod) "${TW_KUBECTL[@]}" -n "$ns" get pods "$name" -o custom-columns=NAME:.metadata.name 2>/dev/null | awk 'NR>1 && $1!="" {print $1}'; return 0 ;;
+    service) sel=$(tw_svc_selector "$ns" "$name") ;;
+    deployment) sel=$(tw_deploy_selector "$ns" "$name") ;;
+  esac
+  [[ -n "$sel" ]] || return 0
+  "${TW_KUBECTL[@]}" -n "$ns" get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase --sort-by=.status.startTime 2>/dev/null \
+    | awk 'NR>1 && $1!="" {print $1}'
+}
+
+tw_instance_index() { # token default_instance count → n (1-based, oldest=1)
+  local tok="$1" def="$2" count="$3" n
+  case "$tok" in
+    oldest) n=1 ;;
+    latest) n="$count" ;;
+    num-*) n="${tok#num-}" ;;
+    default|first|"")
+      case "$def" in
+        oldest) n=1 ;;
+        latest) n="$count" ;;
+        num-*) n="${def#num-}" ;;
+        *) n=1 ;;
+      esac
+      ;;
+    *) fail "bad instance selector: $tok" ;;
+  esac
+  [[ "$n" =~ ^[0-9]+$ ]] || fail "bad instance index: $n"
+  (( n >= 1 && n <= count )) || fail "instance index $n out of range ($count pod(s) found)"
+  echo "$n"
+}
+
+tw_instance_port() { # base n → base + 2n + 4 (owner-confirmed formula)
+  echo $(($1 + 2 * $2 + 4))
+}
+
+# --- Tunnel profiles: plan ----------------------------------------------------
+T_KEY=(); T_SLUG=(); T_KIND=(); T_DIR=(); T_NS=(); T_TARGET=(); T_LOCAL=(); T_REMOTE=(); T_POD=(); T_LABEL=(); T_EP=(-1); T_STARTED=(); T_RESTARTS=(); T_PID=()
+declare -a PLAN_WARN=() PLAN_ERRORS=()
+
+tw_add_row() { # key slug kind dir ns target local remote pod label ep
+  T_KEY+=("$1"); T_SLUG+=("$2"); T_KIND+=("$3"); T_DIR+=("$4"); T_NS+=("$5")
+  T_TARGET+=("$6"); T_LOCAL+=("$7"); T_REMOTE+=("$8"); T_POD+=("$9")
+  T_LABEL+=("${10}"); T_EP+=("${11}"); T_STARTED+=("0"); T_RESTARTS+=("0"); T_PID+=("")
+}
+
+tw_list_has() { local want="$1" x; shift; for x in "$@"; do [[ "$x" == "$want" ]] && return 0; done; return 1; }
+
+tw_refusal() { PLAN_ERRORS+=("🔥 no port for $1 — add default_port to the profile or pass $1:PORT"); }
+
+tw_gap_warnings() { # ≥20-port authoring guidance between distinct endpoint bases
+  local -a bases=() labels=() i j
+  for i in "${!EP_SLUG[@]}"; do
+    if [[ "${EP_DIR[$i]}" == l2k ]]; then
+      bases+=("${EP_LOCAL_PORT[$i]}"); labels+=("${EP_SLUG[$i]}:local")
+    else
+      [[ -n "${EP_DEFAULT_PORT[$i]:-}" ]] || continue
+      bases+=("${EP_DEFAULT_PORT[$i]}"); labels+=("${EP_SLUG[$i]}")
+    fi
+  done
+  local a b gap
+  for i in "${!bases[@]}"; do
+    for j in "${!bases[@]}"; do
+      (( j <= i )) && continue
+      a=${bases[$i]}; b=${bases[$j]}
+      (( a > b )) && { local t=$a; a=$b; b=$t; }
+      gap=$((b - a))
+      (( gap < 20 )) && PLAN_WARN+=("⚠️  gap ${labels[$i]} ↔ ${labels[$j]} is ${gap} ports (<20 guidance) — consider wider spacing")
+    done
+  done
+}
+
+tw_parse_spec() { # spec → R_RAW R_NAME R_NS R_SLUG R_TOK R_PORT
+  R_RAW=0; R_NAME=""; R_NS=""; R_SLUG=""; R_TOK="default"; R_PORT=""
+  local s="$1" port="" base
+  if [[ "$s" == */* ]]; then
+    R_RAW=1
+    base="${s%%:*}"
+    [[ "$s" == *:* ]] && port="${s##*:}"
+    R_NAME="${base%%/*}"; R_NS="${base#*/}"
+    [[ -z "$R_NAME" || -z "$R_NS" || "$R_NS" == */* ]] && fail "bad spec '$s' (want name/namespace[:PORT])"
+    [[ -z "$port" ]] || is_port "$port" || fail "bad port in spec '$s'"
+    R_PORT="$port"
+    return 0
+  fi
+  if [[ "$s" == *:* ]]; then
+    port="${s##*:}"; s="${s%:*}"
+    is_port "$port" || fail "bad port in spec '$1'"
+    R_PORT="$port"
+  fi
+  if [[ "$s" =~ ^(.+)-num-([0-9]+)$ ]]; then
+    R_SLUG="${BASH_REMATCH[1]}"; R_TOK="num-${BASH_REMATCH[2]}"
+  else
+    case "$s" in
+      *-oldest)  R_SLUG="${s%-oldest}";  R_TOK="oldest" ;;
+      *-latest)  R_SLUG="${s%-latest}";  R_TOK="latest" ;;
+      *-default) R_SLUG="${s%-default}"; R_TOK="default" ;;
+      *)         R_SLUG="$s" ;;
+    esac
+  fi
+  [[ -n "$R_SLUG" ]] || fail "bad spec '$1'"
+  return 0
+}
+
+tw_plan() { # specs... → T_* rows (+ PLAN_WARN / PLAN_ERRORS)
+  tw_load_catalog
+  local -a specs=("$@") inst_key=() inst_slug=() inst_ns=() inst_pod=() inst_lp=() inst_rp=() inst_lbl=() inst_ep=()
+  if [[ ${#specs[@]} -eq 0 ]]; then
+    local i; for i in "${!EP_SLUG[@]}"; do specs+=("${EP_SLUG[$i]}"); done
+  fi
+  local spec e dir tok lp rp podsel pods=() n k target label kind svc
+  for spec in ${specs[@]+"${specs[@]}"}; do
+    tw_parse_spec "$spec"
+    if [[ $R_RAW -eq 1 ]]; then
+      lp=""; rp=""
+      rp=$(catalog_remote_for "$R_NAME") && rp="${rp}" || rp=""
+      if [[ -n "$R_PORT" ]]; then
+        lp="$R_PORT"
+        [[ -z "$rp" ]] && rp="$R_PORT"
+      else
+        lp=$(catalog_local_for "$R_NAME") && lp="${lp}" || lp=""
+      fi
+      if [[ -z "$lp" ]]; then
+        PLAN_ERRORS+=("🔥 no port for $spec — pass $spec:PORT or add it to the catalog")
+        continue
+      fi
+      tw_add_row "tw-raw-${R_NAME}-${R_NS}" "$R_NAME" "raw" "k2l" "$R_NS" "svc/${R_NAME}" "$lp" "$rp" "" "raw" -1
+      continue
+    fi
+    e=$(pf_endpoint_index "$R_SLUG") || { PLAN_ERRORS+=("🔥 $R_SLUG: unknown endpoint"); continue; }
+    dir="${EP_DIR[$e]}"; tok="$R_TOK"
+    if [[ "$dir" == l2k ]]; then
+      [[ "$tok" == "default" ]] || { PLAN_ERRORS+=("🔥 $spec: instance selectors apply to k2l endpoints only"); continue; }
+      lp="${R_PORT:-${EP_LOCAL_PORT[$e]}}"
+      rp="${EP_REMOTE_PORT[$e]}"
+      tw_add_row "tw-l2k-${EP_SLUG[$e]}" "${EP_SLUG[$e]}" "l2k" "l2k" "-" "$PF_SSH_HOST" "$lp" "$rp" "" "reverse" "$e"
+      continue
+    fi
+    svc="${EP_SVC[$e]:-}"
+    case "${EP_KIND[$e]}" in
+      pod) target="pod/${svc}"; kind="pod" ;;
+      deployment) target="deploy/${svc}"; kind="deployment" ;;
+      *) target="svc/${svc}"; kind="service" ;;
+    esac
+    rp=$(catalog_remote_for "$svc") && rp="${rp}" || { rp=$(catalog_remote_for "${EP_SLUG[$e]}") && rp="${rp}" || rp=""; }
+    if [[ "$tok" == "default" ]]; then
+      lp="${R_PORT:-${EP_DEFAULT_PORT[$e]:-}}"
+      if [[ -z "$lp" ]]; then tw_refusal "$spec"; continue; fi
+      if [[ -z "$rp" ]]; then PLAN_ERRORS+=("🔥 no remote port for $spec — service '$svc' not in catalog; add it to share/port-forwards.catalog"); continue; fi
+      tw_add_row "tw-${EP_SLUG[$e]}" "${EP_SLUG[$e]}" "default" "k2l" "${EP_NS[$e]}" "$target" "$lp" "$rp" "" "default" "$e"
+      if [[ "${EP_INSTANCES[$e]}" == "true" ]]; then
+        pods=()
+        while IFS= read -r _p; do [[ -n "$_p" ]] && pods+=("$_p"); done < <(tw_list_pods "${EP_NS[$e]}" "$kind" "$svc")
+        for k in "${!pods[@]}"; do
+          n=$((k + 1))
+          inst_key+=("tw-${EP_SLUG[$e]}-n$n"); inst_slug+=("${EP_SLUG[$e]}"); inst_ns+=("${EP_NS[$e]}")
+          inst_pod+=("${pods[$k]}"); inst_lp+=("$(tw_instance_port "${EP_DEFAULT_PORT[$e]}" "$n")")
+          inst_rp+=("$rp"); inst_lbl+=("instance n$n"); inst_ep+=("$e")
+        done
+      fi
+    else
+      pods=()
+      while IFS= read -r _p; do [[ -n "$_p" ]] && pods+=("$_p"); done < <(tw_list_pods "${EP_NS[$e]}" "$kind" "$svc")
+      local count=${#pods[@]}
+      (( count > 0 )) || { PLAN_ERRORS+=("🔥 $spec: no pods found for ${EP_SLUG[$e]} (${EP_NS[$e]}/$svc)"); continue; }
+      n=$(tw_instance_index "$tok" "${EP_DEFAULT_INSTANCE[$e]}" "$count")
+      lp="${R_PORT:-$(tw_instance_port "${EP_DEFAULT_PORT[$e]:-0}" "$n")}"
+      [[ -n "$rp" ]] || { PLAN_ERRORS+=("🔥 no remote port for $spec — service '$svc' not in catalog; add it to share/port-forwards.catalog"); continue; }
+      tw_add_row "tw-${EP_SLUG[$e]}-n$n" "${EP_SLUG[$e]}" "instance" "k2l" "${EP_NS[$e]}" "pod/${pods[$((n - 1))]}" "$lp" "$rp" "${pods[$((n - 1))]}" "instance n$n" "$e"
+    fi
+  done
+  # Per-instance rows: defaults (and earlier instance rows) take precedence.
+  local -a taken=()
+  local i
+  for i in "${!T_KEY[@]}"; do taken+=("${T_LOCAL[$i]}"); done
+  for i in "${!inst_key[@]}"; do
+    if tw_list_has "${inst_lp[$i]}" "${taken[@]}"; then
+      PLAN_WARN+=("🔥 WARNING: dropping ${inst_slug[$i]} ${inst_lbl[$i]} — local port ${inst_lp[$i]} collides with a default/explicit port")
+    else
+      tw_add_row "${inst_key[$i]}" "${inst_slug[$i]}" "instance" "k2l" "${inst_ns[$i]}" "pod/${inst_pod[$i]}" "${inst_lp[$i]}" "${inst_rp[$i]}" "${inst_pod[$i]}" "${inst_lbl[$i]}" "${inst_ep[$i]}"
+      taken+=("${inst_lp[$i]}")
+    fi
+  done
+  tw_gap_warnings
+  return 0
+}
+
+# --- Tunnel profiles: state ---------------------------------------------------
+tw_state_file() { echo "$STATE_DIR/tunnels.tsv"; }
+
+tw_state_persist() {
+  local i line
+  local tmp; tmp="$STATE_DIR/tunnels.tsv.tmp"
+  : >"$tmp"
+  for i in "${!T_KEY[@]}"; do
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "${T_KEY[$i]}" "${T_SLUG[$i]}" "${T_KIND[$i]}" "${T_DIR[$i]}" "${T_NS[$i]}" \
+      "${T_TARGET[$i]}" "${T_LOCAL[$i]}" "${T_REMOTE[$i]}" "${T_POD[$i]}" \
+      "${T_PID[$i]}" "${T_STARTED[$i]}" "${T_RESTARTS[$i]}" "${T_LABEL[$i]}" >>"$tmp"
+  done
+  mv "$tmp" "$(tw_state_file)"
+}
+
+tw_rows_reset() {
+  T_KEY=(); T_SLUG=(); T_KIND=(); T_DIR=(); T_NS=(); T_TARGET=(); T_LOCAL=(); T_REMOTE=()
+  T_POD=(); T_LABEL=(); T_EP=(); T_STARTED=(); T_RESTARTS=(); T_PID=()
+}
+
+tw_state_load() {
+  tw_rows_reset
+  T_KEY=(); T_SLUG=(); T_KIND=(); T_DIR=(); T_NS=(); T_TARGET=(); T_LOCAL=(); T_REMOTE=()
+  T_POD=(); T_LABEL=(); T_EP=(); T_STARTED=(); T_RESTARTS=(); T_PID=()
+  local f line
+  f="$(tw_state_file)"
+  [[ -f "$f" ]] || return 0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local -a c
+    IFS='|' read -ra c <<<"$line"
+    T_KEY+=("${c[0]:-}"); T_SLUG+=("${c[1]:-}"); T_KIND+=("${c[2]:-}"); T_DIR+=("${c[3]:-}")
+    T_NS+=("${c[4]:-}"); T_TARGET+=("${c[5]:-}"); T_LOCAL+=("${c[6]:-}"); T_REMOTE+=("${c[7]:-}")
+    T_POD+=("${c[8]:-}"); T_PID+=("${c[9]:-}"); T_STARTED+=("${c[10]:-0}"); T_RESTARTS+=("${c[11]:-0}")
+    T_LABEL+=("${c[12]:-}"); T_EP+=("-1")
+  done <"$f"
+}
+
+tw_state_restarts_for() {
+  local key="$1" f line old
+  f="$(tw_state_file)"
+  [[ -f "$f" ]] || { echo 0; return; }
+  old=$(awk -F'|' -v k="$key" '$1==k{print $12; exit}' "$f")
+  echo "${old:-0}"
+}
+
+# --- Tunnel profiles: node ip (for l2k health) ---------------------------------
+tw_node_ip() { # ssh_host → node InternalIP, or the hostname itself as fallback
+  local host="$1" cache="$STATE_DIR/tw-node-ip" norm="${1//./-}" out name nname ip line
+  norm="${norm//_/-}"
+  if [[ -f "$cache" ]]; then
+    line=$(awk -F'|' -v h="$norm" '$1==h{print $2; exit}' "$cache")
+    [[ -n "$line" ]] && { echo "$line"; return 0; }
+  fi
+  out=$("${TW_KUBECTL[@]}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{range .status.addresses[*]}{.type}{"="}{.address}{" "}{end}{"\n"}{end}' 2>/dev/null) || out=""
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    name="${line%%|*}"
+    nname="${name//./-}"; nname="${nname//_/-}"
+    if [[ "$nname" == "$norm" ]]; then
+      ip=$(printf '%s\n' "${line#*|}" | tr ' ' '\n' | sed -n 's/^InternalIP=//p' | head -1)
+      if [[ -n "$ip" ]]; then
+        printf '%s|%s\n' "$norm" "$ip" >>"$cache"
+        echo "$ip"
+        return 0
+      fi
+    fi
+  done <<<"$out"
+  echo "$host"
+}
+
+# --- Tunnel profiles: spawn ---------------------------------------------------
+tw_argv_str() { local a; for a in "$@"; do printf '%s ' "$a"; done; printf '\n'; }
+
+tw_k2l_argv() { # ns target lp rp → prints argv
+  tw_argv_str "${TW_KUBECTL[@]}" -n "$1" port-forward "$2" --address 127.0.0.1 "$3:$4"
+}
+
+tw_l2k_argv() { # rp lp ssh_host → prints argv (autossh preferred, else plain ssh)
+  local -a cmd
+  if command -v autossh >/dev/null 2>&1; then
+    cmd=(autossh -M 0 -N)
+  else
+    cmd=(ssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes)
+  fi
+  cmd+=(-R "*:$1:127.0.0.1:$2" "$3")
+  tw_argv_str "${cmd[@]}"
+}
+
+tw_spawn_k2l() { # idx → spawns from T_* row; sets T_PID[idx]
+  local i="$1" key="${T_KEY[$i]}" pidf="$STATE_DIR/${T_KEY[$i]}.pid" klog="$STATE_DIR/${T_KEY[$i]}.kubectl.log" old
+  if [[ -f "$pidf" ]]; then
+    old=$(cat "$pidf" 2>/dev/null || true)
+    if [[ "$old" != "external" ]] && is_alive "$old"; then
+      kill "$old" 2>/dev/null || true; sleep 0.2; kill -9 "$old" 2>/dev/null || true
+    fi
+    rm -f "$pidf"
+  fi
+  if port_open "${T_LOCAL[$i]}" "127.0.0.1"; then
+    warn "${key}: 127.0.0.1:${T_LOCAL[$i]} already open (external); not reclaiming"
+    echo "external" >"$pidf"
+    T_PID[$i]="external"
+    return 0
+  fi
+  "${TW_KUBECTL[@]}" -n "${T_NS[$i]}" port-forward "${T_TARGET[$i]}" --address 127.0.0.1 "${T_LOCAL[$i]}:${T_REMOTE[$i]}" >"$klog" 2>&1 &
+  T_PID[$i]=$!
+  echo "${T_PID[$i]}" >"$pidf"
+  return 0
+}
+
+tw_spawn_l2k() { # idx
+  local i="$1" pidf="$STATE_DIR/${T_KEY[$i]}.pid" klog="$STATE_DIR/${T_KEY[$i]}.ssh.log" old
+  local -a cmd
+  if [[ -f "$pidf" ]]; then
+    old=$(cat "$pidf" 2>/dev/null || true)
+    if [[ "$old" != "external" ]] && is_alive "$old"; then
+      kill "$old" 2>/dev/null || true; sleep 0.2; kill -9 "$old" 2>/dev/null || true
+    fi
+    rm -f "$pidf"
+  fi
+  if command -v autossh >/dev/null 2>&1; then
+    cmd=(autossh -M 0 -N)
+    AUTOSSH_GATETIME=0 AUTOSSH_PORT=0 "${cmd[@]}" \
+      -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+      -R "*:${T_REMOTE[$i]}:127.0.0.1:${T_LOCAL[$i]}" "${T_TARGET[$i]}" >"$klog" 2>&1 &
+  else
+    cmd=(ssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes)
+    "${cmd[@]}" -R "*:${T_REMOTE[$i]}:127.0.0.1:${T_LOCAL[$i]}" "${T_TARGET[$i]}" >"$klog" 2>&1 &
+  fi
+  T_PID[$i]=$!
+  echo "${T_PID[$i]}" >"$pidf"
+  log "l2k up ${T_KEY[$i]} ${T_TARGET[$i]}:${T_REMOTE[$i]} <- 127.0.0.1:${T_LOCAL[$i]}"
+  return 0
+}
+
+tw_stop_row() { # idx
+  local i="$1" pidf="$STATE_DIR/${T_KEY[$i]}.pid" old
+  [[ -f "$pidf" ]] && old=$(cat "$pidf" 2>/dev/null || true) || old=""
+  if [[ -n "$old" && "$old" != "external" ]] && is_alive "$old"; then
+    kill "$old" 2>/dev/null || true; sleep 0.15; kill -9 "$old" 2>/dev/null || true
+    ok "stopped ${T_KEY[$i]} (pid $old)"
+  fi
+  rm -f "$pidf" "$STATE_DIR/${T_KEY[$i]}.kubectl.log" "$STATE_DIR/${T_KEY[$i]}.ssh.log" 2>/dev/null || true
+}
+
+tw_stop_all() {
+  tw_state_load
+  local i
+  for i in "${!T_KEY[@]}"; do tw_stop_row "$i"; done
+  rm -f "$(tw_state_file)" 2>/dev/null || true
+}
+
+# --- Tunnel profiles: health / report -----------------------------------------
+tw_row_online() { # idx → 0 online
+  local i="$1" pid="${T_PID[$i]}" host
+  if [[ "${T_DIR[$i]}" == "l2k" ]]; then
+    host=$(tw_node_ip "${T_TARGET[$i]}")
+    port_open "${T_REMOTE[$i]}" "$host"
+  else
+    [[ "$pid" == "external" ]] || is_alive "$pid" || return 1
+    port_open "${T_LOCAL[$i]}" "127.0.0.1"
+  fi
+}
+
+tw_row_state() { # idx → online | offline | starting
+  local i="$1"
+  if [[ -z "${T_PID[$i]}" ]]; then echo "planned"; return 0; fi
+  if tw_row_online "$i"; then echo "online"; else echo "offline"; fi
+}
+
+tw_human_dur() {
+  local s="$1" out=""
+  if (( s >= 3600 )); then printf '%dh%02dm%02ds' $((s / 3600)) $((s % 3600 / 60)) $((s % 60))
+  elif (( s >= 60 )); then printf '%dm%02ds' $((s / 60)) $((s % 60))
+  else printf '%ds' "$s"
+  fi
+}
+
+tw_print_table() { # T_* rows; mode=plan|live
+  local mode="${1:-live}" i state now up pod
+  printf '%-20s %-12s %-38s %-4s %-7s %-7s %-9s %-9s %s\n' \
+    "SLUG" "NS" "TARGET/POD" "DIR" "LOCAL" "REMOTE" "STATE" "UPTIME" "RST"
+  now=$(date +%s)
+  for i in "${!T_KEY[@]}"; do
+    state="planned"
+    [[ "$mode" == live ]] && state=$(tw_row_state "$i")
+    if [[ -n "${T_POD[$i]}" ]]; then pod="${T_POD[$i]}"; else pod="-"; fi
+    up="-"
+    if [[ "$mode" == live && "${T_STARTED[$i]}" -gt 0 ]]; then up=$(tw_human_dur $((now - T_STARTED[$i]))); fi
+    printf '%-20s %-12s %-38s %-4s %-7s %-7s %-9s %-9s %s\n' \
+      "${T_KEY[$i]}" "${T_NS[$i]}" "${T_TARGET[$i]}" \
+      "${T_DIR[$i]}" "${T_LOCAL[$i]}" "${T_REMOTE[$i]}" "$state" "$up" "${T_RESTARTS[$i]}"
+  done
+}
+
+tw_print_json() { # T_* rows; mode=plan|live
+  local mode="${1:-live}" i state first=1 err="" now
+  now=$(date +%s)
+  printf '['
+  for i in "${!T_KEY[@]}"; do
+    state="planned"; err=""
+    [[ "$mode" == live ]] && { state=$(tw_row_state "$i"); [[ "$state" != online ]] && err="not online"; }
+    [[ $first -eq 1 ]] && first=0 || printf ','
+    printf '\n  {"slug":"%s","namespace":"%s","target":"%s","direction":"%s","local_port":%s,"remote_port":%s,"pod":"%s","state":"%s","error":"%s"}' \
+      "${T_SLUG[$i]}" "${T_NS[$i]}" "${T_TARGET[$i]}" "${T_DIR[$i]}" \
+      "${T_LOCAL[$i]}" "${T_REMOTE[$i]}" "${T_POD[$i]}" "$state" "$err"
+  done
+  [[ $first -eq 1 ]] || printf '\n'
+  printf ']\n'
+}
+
+tw_plan_report() { # warnings/errors to stderr
+  local w
+  for w in "${PLAN_ERRORS[@]+"${PLAN_ERRORS[@]}"}"; do printf '%s\n' "$w" >&2; done
+  for w in "${PLAN_WARN[@]+"${PLAN_WARN[@]}"}"; do printf '\033[31m%s\033[0m\n' "$w" >&2; done
+}
+
+# --- Tunnel profiles: headless up ---------------------------------------------
+cmd_up() {
+  local prof="" spec_args=() tw_timeout="30s" json=0 dry=0 watch=0 tui=0 a
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile) prof="$2"; shift 2 ;;
+      --include|-i) local -a parts; IFS=',' read -ra parts <<<"$2"; spec_args+=("${parts[@]}"); shift 2 ;;
+      --timeout) tw_timeout="$2"; shift 2 ;;
+      --json) json=1; shift ;;
+      --dry-run) dry=1; shift ;;
+      --watch) watch=1; shift ;;
+      --tui) tui=1; shift ;;
+      -h|--help) usage 0 ;;
+      --*) fail "up: unknown flag: $1" ;;
+      *) spec_args+=("$1"); shift ;;
+    esac
+  done
+  prof="${prof:-${TUNNEL_WATCHER_PROFILE:-}}"
+  local ppath
+  ppath=$(pf_resolve_profile "$prof") || exit 1
+  pf_parse "$ppath"
+  local tsec; tsec=$(parse_duration "$tw_timeout")
+
+  tw_plan ${spec_args[@]+"${spec_args[@]}"}
+  if [[ ${#PLAN_ERRORS[@]} -gt 0 ]]; then
+    tw_plan_report
+    exit 1
+  fi
+  tw_plan_report
+
+  local i
+  if [[ $dry -eq 1 ]]; then
+    for i in "${!T_KEY[@]}"; do
+      if [[ "${T_DIR[$i]}" == "l2k" ]]; then
+        printf 'DRY-RUN: '; tw_l2k_argv "${T_REMOTE[$i]}" "${T_LOCAL[$i]}" "${T_TARGET[$i]}"
+      else
+        printf 'DRY-RUN: '; tw_k2l_argv "${T_NS[$i]}" "${T_TARGET[$i]}" "${T_LOCAL[$i]}" "${T_REMOTE[$i]}"
+      fi
+    done
+    [[ $json -eq 1 ]] && tw_print_json plan
+    exit 0
+  fi
+
+  for i in "${!T_KEY[@]}"; do
+    if [[ "${T_DIR[$i]}" == "l2k" ]]; then tw_spawn_l2k "$i"; else tw_spawn_k2l "$i"; fi
+    T_STARTED[$i]=$(date +%s)
+    T_RESTARTS[$i]=$(tw_state_restarts_for "${T_KEY[$i]}")
+  done
+  tw_state_persist
+
+  local deadline=$(( $(date +%s) + tsec )) alldone
+  while :; do
+    alldone=1
+    for i in "${!T_KEY[@]}"; do
+      tw_row_online "$i" || alldone=0
+    done
+    [[ $alldone -eq 1 ]] && break
+    (( $(date +%s) >= deadline )) && break
+    sleep 0.5
+  done
+
+  if [[ $json -eq 1 ]]; then tw_print_json live; else tw_print_table live; fi
+  local rc=0
+  for i in "${!T_KEY[@]}"; do tw_row_online "$i" || rc=1; done
+
+  if [[ $watch -eq 1 ]]; then
+    info "supervising ${#T_KEY[@]} tunnel(s); poll ${POLL_SEC}s (Ctrl-C stops + tears down)"
+    tw_supervise  # never returns
+  fi
+  if [[ $tui -eq 1 ]]; then
+    tw_tui_loop  # returns on q (detach) / Q (teardown)
+  fi
+  exit "$rc"
+}
+
+tw_supervise() {
+  trap 'tw_stop_all; exit 0' INT TERM EXIT
+  local -a fails=() lasttry=()
+  local i n now backoff
+  n=${#T_KEY[@]}
+  for i in "${!T_KEY[@]}"; do fails+=(0); lasttry+=(0); done
+  while :; do
+    for i in "${!T_KEY[@]}"; do
+      if tw_row_online "$i"; then
+        fails[$i]=0
+        continue
+      fi
+      now=$(date +%s)
+      backoff=$(( POLL_SEC * (2 ** fails[$i]) ))
+      (( backoff > 60 )) && backoff=60
+      if (( now - lasttry[$i] >= backoff )); then
+        warn "${T_KEY[$i]}: restarting (backoff ${backoff}s)"
+        log "restart ${T_KEY[$i]}"
+        if [[ "${T_DIR[$i]}" == "l2k" ]]; then tw_spawn_l2k "$i"; else tw_spawn_k2l "$i"; fi
+        T_STARTED[$i]=$(date +%s)
+        T_RESTARTS[$i]=$(( $(tw_state_restarts_for "${T_KEY[$i]}") + 1 ))
+        tw_state_persist
+        fails[$i]=$(( (fails[$i] + 1) > 6 ? 6 : fails[$i] + 1 ))
+        lasttry[$i]=$now
+      fi
+    done
+    sleep "$POLL_SEC"
+  done
+}
+
+# --- Tunnel profiles: TUI -----------------------------------------------------
+cmd_tui() {
+  local prof="${TUNNEL_WATCHER_PROFILE:-}"
+  local ppath
+  ppath=$(pf_resolve_profile "$prof") || exit 1
+  pf_parse "$ppath"
+  tw_load_catalog
+  if ! { [[ -t 0 ]] && [[ -t 1 ]]; }; then
+    tw_state_load
+    tw_print_table live
+    return 0
+  fi
+  tw_tui_loop
+}
+
+tw_tui_loop() {
+  local sel=0 page="root" msg="" i key rest
+  if ! { [[ -t 0 ]] && [[ -t 1 ]]; }; then
+    tw_state_load
+    tw_print_table live
+    return 0
+  fi
+  local -a D_ITEMS=()
+  D_TITLE=""; D_SEL=""; D_NSSEL=""; D_SVCSEL=""
+  tw_state_load
+  printf '\033[?25l'
+  tw_tui_cleanup() { printf '\033[?25h\033[0m'; }
+  trap 'tw_tui_cleanup; exit 0' INT TERM
+  trap 'tw_tui_cleanup' EXIT
+  while :; do
+    tw_state_load
+    tw_tui_render "$sel" "$page" "$msg"
+    msg=""
+    key=""
+    IFS= read -rsn1 -t 1 key || true
+    if [[ "$key" == $'\x1b' ]]; then
+      rest=""
+      IFS= read -rsn2 -t 0.05 rest || true
+      key="$key$rest"
+    fi
+    local nrows=${#T_KEY[@]}
+    if [[ "$page" != "root" ]]; then
+      case "$key" in
+        j|'[B') (( D_SEL < ${#D_ITEMS[@]} - 1 )) && D_SEL=$((D_SEL + 1)) ;;
+        k|'[A') (( D_SEL > 0 )) && D_SEL=$((D_SEL - 1)) ;;
+        '[D') page="root" ;;
+        $'\r'|$'\n')
+          tw_tui_drill_pick "$sel" "$page" && { page="root"; sel=0; }
+          ;;
+        q) break ;;
+        Q) tw_stop_all; msg="torn down"; break ;;
+      esac
+      continue
+    fi
+    case "$key" in
+      j|'[B') (( sel < nrows - 1 )) && sel=$((sel + 1)) ;;
+      k|'[A') (( sel > 0 )) && sel=$((sel - 1)) ;;
+      $'\r'|$'\n')
+        if [[ $nrows -gt 0 ]]; then
+          page="ns"; D_SEL=""; msg=""
+          tw_tui_page_ns
+        fi
+        ;;
+      p) tw_tui_edit_port sel msg ;;
+      s) tw_tui_toggle sel msg ;;
+      r) tw_tui_restart_row sel msg ;;
+      a) tw_tui_arm msg ;;
+      K) tw_tui_killall msg ;;
+      q) break ;;
+      Q) tw_stop_all; msg="torn down"; break ;;
+    esac
+  done
+  tw_tui_cleanup
+  trap - INT TERM EXIT
+  return 0
+}
+
+tw_tui_page_ns() {
+  D_TITLE="namespaces"; D_ITEMS=(); D_SEL=""
+  local line
+  while IFS= read -r line; do [[ -n "$line" ]] && D_ITEMS+=("$line"); done \
+    < <("${TW_KUBECTL[@]}" get ns -o custom-columns=NAME:.metadata.name 2>/dev/null | awk 'NR>1')
+}
+
+tw_tui_page_svc() { # ns
+  D_TITLE="services in $1"; D_ITEMS=(); D_NSSEL="$1"; D_SEL=""
+  local line
+  while IFS= read -r line; do [[ -n "$line" ]] && D_ITEMS+=("$line"); done \
+    < <("${TW_KUBECTL[@]}" -n "$1" get svc -o custom-columns=NAME:.metadata.name 2>/dev/null | awk 'NR>1')
+}
+
+tw_tui_page_pods() { # ns svc
+  D_TITLE="pods for $2 (ns $1)"; D_ITEMS=(); D_NSSEL="$1"; D_SVCSEL="$2"; D_SEL=""
+  local line
+  while IFS= read -r line; do [[ -n "$line" ]] && D_ITEMS+=("$line"); done \
+    < <(tw_list_pods "$1" service "$2")
+  if [[ ${#D_ITEMS[@]} -eq 0 ]]; then
+    while IFS= read -r line; do [[ -n "$line" ]] && D_ITEMS+=("$line"); done \
+      < <("${TW_KUBECTL[@]}" -n "$1" get pods -o custom-columns=NAME:.metadata.name 2>/dev/null | awk 'NR>1')
+  fi
+}
+
+# returns 0 when the drill selection resolves to an action (back to root)
+tw_tui_drill_pick() { # tunnel-row-idx page
+  local row="$1" item="${D_ITEMS[${D_SEL:-}]}"
+  if [[ -z "$item" ]]; then
+    return 1
+  fi
+  case "$D_TITLE" in
+    namespaces*)
+      tw_tui_page_svc "$item"
+      return 1
+      ;;
+    services\ in\ *)
+      tw_tui_page_pods "$D_NSSEL" "$item"
+      return 1
+      ;;
+    pods\ for\ *)
+      tw_tui_repoint "$row" "$item"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+tw_tui_repoint() { # tunnel-row-idx pod — re-point the row's local port at pod
+  local i="$1" pod="$2"
+  if [[ "${T_DIR[$i]}" != "k2l" ]]; then
+    printf -v "$msgvar" '%s' "cannot re-point a non-k2l tunnel"
+    return 1
+  fi
+  local old_pid="${T_PID[$i]}" pidf="$STATE_DIR/${T_KEY[$i]}.pid" klog="$STATE_DIR/${T_KEY[$i]}.kubectl.log"
+  if [[ -n "$old_pid" && "$old_pid" != "external" ]] && is_alive "$old_pid"; then
+    kill "$old_pid" 2>/dev/null || true; sleep 0.2; kill -9 "$old_pid" 2>/dev/null || true
+  fi
+  info "${T_KEY[$i]}: re-pointing 127.0.0.1:${T_LOCAL[$i]} → pod/${pod}"
+  "${TW_KUBECTL[@]}" -n "${T_NS[$i]}" port-forward "pod/${pod}" --address 127.0.0.1 "${T_LOCAL[$i]}:${T_REMOTE[$i]}" >"$klog" 2>&1 &
+  T_PID[$i]=$!
+  echo "${T_PID[$i]}" >"$pidf"
+  T_POD[$i]="$pod"
+  T_TARGET[$i]="pod/${pod}"
+  T_STARTED[$i]=$(date +%s)
+  tw_state_persist
+  return 0
+}
+
+tw_tui_edit_port() { # sel msg-var
+  local i="$1" msgvar="$2" e newp
+  e="${T_EP[$i]}"
+  (( e >= 0 )) || { printf -v "$msgvar" '%s' "row has no profile endpoint to edit"; return 1; }
+  printf '\033[%d;1H\033[Knew local port for %s [current %s]: ' \
+    "$(( ${LINES:-40} - 1 ))" "${EP_SLUG[$e]}" "${EP_DEFAULT_PORT[$e]:-none}"
+  printf '\033[?25h'
+  read -r newp </dev/tty
+  printf '\033[?25l'
+  [[ "$newp" =~ ^[0-9]+$ ]] || { printf -v "$msgvar" '%s' "not a port: $newp"; return 1; }
+  is_port "$newp" || { printf -v "$msgvar" '%s' "port out of range: $newp"; return 1; }
+  local oldp="${EP_DEFAULT_PORT[$e]:-}"
+  tw_profile_set_default_port "${PF_FILE}" "${EP_SLUG[$e]}" "$newp" || {
+    printf -v "$msgvar" '%s' "profile edit failed"; return 1; }
+  pf_parse "${PF_FILE}"
+  printf -v "$msgvar" '%s' "${EP_SLUG[$e]} default_port ${oldp:-none} → ${newp} (${PF_FILE})"
+  # live default row: restart it on the new port
+  local j
+  for j in "${!T_KEY[@]}"; do
+    if [[ "${T_EP[$j]}" == "$e" && "${T_KIND[$j]}" == "default" && "${T_PID[$j]}" != "" ]]; then
+      tw_stop_row "$j"
+      tw_spawn_k2l "$j"
+      T_STARTED[$j]=$(date +%s)
+      tw_state_persist
+    fi
+  done
+  return 0
+}
+
+tw_profile_set_default_port() { # file slug newport — precise in-place edit of one endpoint's default_port
+  local file="$1" slug="$2" newp="$3" tmp
+  tmp="$(mktemp)"
+  awk -v slug="$slug" -v newp="$newp" '
+    inep && /^  - / { inep = 0 }
+    $0 ~ ("^  - slug: " slug "[ \t]*$") { inep = 1 }
+    inep && $0 ~ /^[ \t]+default_port:/ { sub(/:[ \t]*[0-9]+/, ": " newp); done = 1 }
+    { print }
+    END { exit (done ? 0 : 4) }
+  ' "$file" >"$tmp"
+  local rc=$?
+  if [[ $rc -eq 0 ]]; then mv "$tmp" "$file"; else rm -f "$tmp"; fi
+  return $rc
+}
+
+tw_tui_toggle() { # sel msg-var
+  local i="$1" msgvar="$2"
+  if [[ "${T_PID[$i]}" == "" ]]; then
+    if [[ "${T_DIR[$i]}" == "l2k" ]]; then tw_spawn_l2k "$i"; else tw_spawn_k2l "$i"; fi
+    T_STARTED[$i]=$(date +%s)
+    tw_state_persist
+    printf -v "$msgvar" '%s' "started ${T_KEY[$i]}"
+  else
+    tw_stop_row "$i"
+    T_PID[$i]=""
+    tw_state_persist
+    printf -v "$msgvar" '%s' "stopped ${T_KEY[$i]}"
+  fi
+  return 0
+}
+
+tw_tui_restart_row() { # sel msg-var
+  local i="$1" msgvar="$2"
+  tw_stop_row "$i"
+  if [[ "${T_DIR[$i]}" == "l2k" ]]; then tw_spawn_l2k "$i"; else tw_spawn_k2l "$i"; fi
+  T_STARTED[$i]=$(date +%s)
+  T_RESTARTS[$i]=$(( $(tw_state_restarts_for "${T_KEY[$i]}") + 1 ))
+  tw_state_persist
+  printf -v "$msgvar" '%s' "restarted ${T_KEY[$i]}"
+  return 0
+}
+
+tw_tui_arm() { # msg-var — bring up the whole profile (defaults + instances + l2k)
+  local msgvar="$1" i
+  tw_rows_reset
+  tw_plan  # no specs = every endpoint (bare slug = default + all instances; l2k rows too)
+  if [[ ${#PLAN_ERRORS[@]} -gt 0 ]]; then
+    printf -v "$msgvar" '%s' "${PLAN_ERRORS[0]}"
+    return 1
+  fi
+  for i in "${!T_KEY[@]}"; do
+    [[ -n "${T_PID[$i]}" ]] && continue
+    if [[ "${T_DIR[$i]}" == "l2k" ]]; then tw_spawn_l2k "$i"; else tw_spawn_k2l "$i"; fi
+    T_STARTED[$i]=$(date +%s)
+    T_RESTARTS[$i]=$(tw_state_restarts_for "${T_KEY[$i]}")
+  done
+  tw_state_persist
+  printf -v "$msgvar" '%s' "armed ${#T_KEY[@]} tunnel(s)"
+  return 0
+}
+
+tw_tui_killall() { # msg-var
+  local msgvar="$1" ans=""
+  printf '\033[%d;1H\033[Kkill ALL tunnels? y/N: ' "$(( ${LINES:-40} - 1 ))"
+  printf '\033[?25h'
+  read -r ans </dev/tty
+  printf '\033[?25l'
+  [[ "$ans" == "y" || "$ans" == "Y" ]] || { printf -v "$msgvar" '%s' "kill-all cancelled"; return 1; }
+  tw_stop_all
+  printf -v "$msgvar" '%s' "all tunnels killed"
+  return 0
+}
+
+tw_tui_render() {
+  local sel="$1" page="$2" msg="$3" i state up now pod line
+  now=$(date +%s)
+  printf '\033[H\033[2J'
+  printf 'cluster-port-forward tui — profile: %s  (tunnels keep running on detach)\n' "${PF_PROFILE:-?}"
+  printf '%-20s %-11s %-34s %-4s %-6s %-6s %-10s %-8s %s\n' \
+    "SLUG" "NS" "TARGET/POD" "DIR" "LOCAL" "REMOTE" "STATE" "UPTIME" "RST"
+  for i in "${!T_KEY[@]}"; do
+    state=$(tw_row_state "$i")
+    case "$state" in online) state="▲online" ;; offline) state="▼offline" ;; *) state="●starting" ;; esac
+    pod="${T_POD[$i]:--}"
+    up="-"; [[ "${T_STARTED[$i]}" -gt 0 ]] && up=$(tw_human_dur $((now - T_STARTED[$i])))
+    line=$(printf '%-20s %-11s %-34s %-4s %-6s %-6s %-10s %-8s %s' \
+      "${T_KEY[$i]}" "${T_NS[$i]}" "${T_TARGET[$i]}" "${T_DIR[$i]}" \
+      "${T_LOCAL[$i]}" "${T_REMOTE[$i]}" "$state" "$up" "${T_RESTARTS[$i]}")
+    if [[ "$i" == "$sel" ]]; then printf '\033[7m%s\033[0m\n' "$line"; else printf '%s\n' "$line"; fi
+  done
+  local w
+  for w in "${PLAN_WARN[@]+"${PLAN_WARN[@]}"}"; do printf '\033[31m%s\033[0m\n' "$w"; done
+  if [[ "$page" != "root" ]]; then
+    printf '\n— %s —  (enter = pick, esc/b = back)\n' "$D_TITLE"
+    local j
+    for j in "${!D_ITEMS[@]}"; do
+      if [[ "$j" == "${D_SEL:-}" ]]; then printf '\033[7m  %s\033[0m\n' "${D_ITEMS[$j]}"; else printf '  %s\n' "${D_ITEMS[$j]}"; fi
+    done
+  fi
+  printf '\033[7m ↑/↓/j/k select · enter drill · p port · s start/stop · r restart · a arm-all · K kill-all · q detach · Q quit+teardown %s\033[0m\033[K\n' "${msg:+ · $msg}"
+}
+
+
 cmd_list() {
   load_catalog
   printf '%-16s %-12s %-32s %5s→%-5s  %-11s %s\n' \
@@ -477,6 +1493,15 @@ cmd_status() {
     fi
     printf '%-16s %-8s %-14s %-14s %s\n' "$name" "$old" "$loopb" "$bindst" "$state"
   done
+  if [[ -f "$(tw_state_file)" ]]; then
+    printf '%s\n' '--- tunnel profiles (up/tui) ---'
+    tw_state_load
+    if [[ ${#T_KEY[@]} -eq 0 ]]; then
+      info 'no tunnel sessions (try: cluster-port-forward up --profile noizu)'
+    else
+      tw_print_table live
+    fi
+  fi
 }
 
 cmd_start() {
@@ -508,6 +1533,9 @@ cmd_stop() {
   fi
   local n
   for n in "${sel[@]}"; do stop_one "$n" || true; done
+  if [[ $# -eq 0 || "${1:-}" == all ]]; then
+    tw_stop_all  # profile tunnels too
+  fi
 }
 
 cmd_watch() {
@@ -556,6 +1584,58 @@ cmd_doctor() {
   [[ $miss -eq 0 ]] && ok "all catalog services present" || warn "$miss missing"
   info "hosts source: ${HOSTS_SRC:-none}"
   info "aliases: cluster-port-forward aliases status"
+
+  # --- Tunnel profiles: ssh host, GatewayPorts, l2k probes, authoring gaps ----
+  local tprof="${TUNNEL_WATCHER_PROFILE:-}" tpath="" tssh line
+  if [[ -n "$tprof" ]]; then
+    tpath=$(pf_resolve_profile "$tprof" 2>/dev/null) || tpath=""
+  fi
+  if [[ -z "$tpath" ]]; then
+    info "tunnel profiles: none active (set TUNNEL_WATCHER_PROFILE or pass --profile)"
+    return 0
+  fi
+  info "tunnel profile: $tpath"
+  pf_parse "$tpath" || return 1
+  tssh="${PF_SSH_HOST:-$TW_DEFAULT_SSH_HOST}"
+  tw_gap_warnings_stderr
+  if command -v ssh >/dev/null 2>&1; then
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$tssh" true >/dev/null 2>&1; then
+      ok "ssh $tssh reachable"
+    else
+      warn "ssh $tssh unreachable (BatchMode probe failed)"
+    fi
+    line=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$tssh" 'grep -i ^gatewayports /etc/ssh/sshd_config' 2>/dev/null | head -1)
+    if printf '%s' "$line" | grep -qiE 'clientspecified|yes'; then
+      ok "GatewayPorts on $tssh: $line"
+    else
+      printf '\033[31m🔥 WARNING: GatewayPorts not enabled on %s — pods cannot reach a loopback-bound reverse port\033[0m\n' "$tssh" >&2
+      warn "remediation (run interactively): ssh -t $tssh, then edit /etc/ssh/sshd_config → 'GatewayPorts clientspecified', then restart sshd (sudo systemctl restart sshd || sudo service ssh restart)"
+    fi
+  else
+    warn "ssh not on PATH; skipping l2k host checks"
+  fi
+  # probe active l2k sessions through the resolved node ip
+  tw_state_load
+  local nip j found=0
+  for j in "${!T_KEY[@]}"; do
+    [[ "${T_DIR[$j]}" == "l2k" ]] || continue
+    found=1
+    nip=$(tw_node_ip "${T_TARGET[$j]}")
+    if port_open "${T_REMOTE[$j]}" "$nip"; then
+      ok "l2k ${T_KEY[$j]}: ${nip}:${T_REMOTE[$j]} reachable"
+    else
+      warn "l2k ${T_KEY[$j]}: ${nip}:${T_REMOTE[$j]} not reachable"
+    fi
+  done
+  [[ $found -eq 0 ]] && info "no active l2k sessions to probe"
+  return 0
+}
+
+tw_gap_warnings_stderr() { # doctor variant of tw_gap_warnings
+  PLAN_WARN=()
+  tw_gap_warnings
+  local w
+  for w in "${PLAN_WARN[@]+"${PLAN_WARN[@]}"}"; do printf '\033[31m%s\033[0m\n' "$w" >&2; done
 }
 
 main() {
@@ -565,6 +1645,21 @@ main() {
     start)   cmd_start "$@" ;;
     stop)    cmd_stop "$@" ;;
     watch|supervise|daemon) cmd_watch "$@" ;;
+    up)      shift 0; cmd_up "$@" ;;
+    tui)     cmd_tui "$@" ;;
+    profile-parse) # debug: parse a profile and dump normalized endpoints
+      local pp
+      pp=$(pf_resolve_profile "${1:-${TUNNEL_WATCHER_PROFILE:-}}") || exit 1
+      pf_parse "$pp"
+      local pi
+      printf 'profile=%s ssh_host=%s file=%s\n' "$PF_PROFILE" "$PF_SSH_HOST" "$PF_FILE"
+      for pi in "${!EP_SLUG[@]}"; do
+        printf 'ep=%d slug=%s ns=%s svc=%s kind=%s dir=%s default_port=%s instances=%s default_instance=%s local_port=%s remote_port=%s\n' \
+          "$((pi + 1))" "${EP_SLUG[$pi]}" "${EP_NS[$pi]}" "${EP_SVC[$pi]:-}" "${EP_KIND[$pi]:-}" \
+          "${EP_DIR[$pi]}" "${EP_DEFAULT_PORT[$pi]:-}" "${EP_INSTANCES[$pi]:-}" \
+          "${EP_DEFAULT_INSTANCE[$pi]:-}" "${EP_LOCAL_PORT[$pi]:-}" "${EP_REMOTE_PORT[$pi]:-}"
+      done
+      ;;
     status|st) cmd_status ;;
     list|ls) cmd_list ;;
     doctor|check) cmd_doctor ;;

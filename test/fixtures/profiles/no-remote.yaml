@@ -1,0 +1,6 @@
+profile: noremote
+endpoints:
+  - slug: ghost
+    namespace: apps
+    service: svc-does-not-exist
+    default_port: 7001
