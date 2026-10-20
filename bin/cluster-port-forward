@@ -1149,6 +1149,27 @@ __daemon_start() {
   done
   if daemon_alive && daemon_web_up; then
     ok "daemon up (pid $dpid) — web UI on http://127.0.0.1:$CPF_WEB_PORT"
+  elif daemon_web_up; then
+    # web answers but our pidfile doesn't: a launchd-started instance won the
+    # boot race — defer to it (KILL our duplicate: its TERM trap would tear
+    # down the winning instance's shared tunnels)
+    local hpid
+    hpid=$(python3 - "$CPF_WEB_PORT" <<'PY'
+import sys, json, urllib.request
+try:
+    print(json.load(urllib.request.urlopen("http://127.0.0.1:%s/api/health" % sys.argv[1], timeout=5)).get("daemon_pid", ""))
+except Exception:
+    print("")
+PY
+)
+    kill -9 "$dpid" 2>/dev/null || true
+    if [[ -f "$STATE_DIR/daemon-web.pid" ]]; then
+      local wpid2; wpid2=$(cat "$STATE_DIR/daemon-web.pid" 2>/dev/null || echo "")
+      [[ -n "$wpid2" ]] && [[ "$wpid2" != "$hpid" ]] && kill -9 "$wpid2" 2>/dev/null
+      rm -f "$STATE_DIR/daemon-web.pid"
+    fi
+    printf '%s\n' "$hpid" >"$DAEMON_PID_FILE" 2>/dev/null || true
+    ok "daemon already running (pid ${hpid:-unknown} — launchd?) — not starting a second supervisor"
   elif is_alive "$dpid"; then
     warn "daemon process running (pid $dpid) but web API not answering yet — check $DAEMON_LOG"
   else
