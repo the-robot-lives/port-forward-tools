@@ -10,6 +10,10 @@
 #   cluster-port-forward up [--profile P] [--include spec ...] [--timeout 30s]
 #                           [--json] [--dry-run] [--watch] [--tui]
 #   cluster-port-forward tui                        # tunnel dashboard (TTY; degrades to status)
+#   cluster-port-forward daemon start|stop|restart|install|uninstall|status|logs
+#   cluster-port-forward daemon install             # always-on via launchd (KeepAlive); web UI on 4321
+#   plain `up`/`stop`/`status` route through the daemon; `--dry-run`, legacy
+#   catalog subcommands, `watch` and `tui` stay purely local.
 #   cluster-port-forward stop  [name|all]
 #   cluster-port-forward status
 #   cluster-port-forward list
@@ -26,6 +30,7 @@
 #   KUBECONFIG          default: ~/.kube/noizu/config
 #   KUBE_CONTEXT        optional kubectl --context (tunnel paths default context: noizu)
 #   CPF_STATE_DIR       default: ${XDG_RUNTIME_DIR:-/tmp}/noizu-port-forwards
+#   CPF_WEB_PORT        daemon web/API port (default 4321, loopback only)
 #   CPF_CATALOG         override catalog path
 #   CPF_HOSTS_FILE      hosts block source (default: share/hosts.local-dev)
 #   CPF_BIND            1 (default) also PF to bind_ip:bind_port when catalog has them
@@ -99,8 +104,8 @@ read_lines() {
 }
 
 usage() {
-  # Header comments only (lines 2–37); avoid bleeding into live code
-  sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+  # Header comments only (lines 2–38); avoid bleeding into live code
+  sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -862,15 +867,35 @@ tw_plan() { # specs... → T_* rows (+ PLAN_WARN / PLAN_ERRORS)
 # --- Tunnel profiles: state ---------------------------------------------------
 tw_state_file() { echo "$STATE_DIR/tunnels.tsv"; }
 
-tw_state_persist() {
-  local i line
+tw_state_persist() { # [replace] — default merge: T_* rows win, unseen file keys preserved.
+  # replace: write exactly T_* (removal paths MUST use it, or merge resurrects
+  # the rows just deleted)
+  local mode="${1:-merge}"
+  local i line key allkeys=" "
+  local -a C_KEY=() C_SLUG=() C_KIND=() C_DIR=() C_NS=() C_TGT=() C_LO=() C_RE=() C_PO=() C_PI=() C_ST=() C_RS=() C_LB=()
+  for i in "${!T_KEY[@]}"; do
+    C_KEY+=("${T_KEY[$i]}"); C_SLUG+=("${T_SLUG[$i]}"); C_KIND+=("${T_KIND[$i]}"); C_DIR+=("${T_DIR[$i]}")
+    C_NS+=("${T_NS[$i]}"); C_TGT+=("${T_TARGET[$i]}"); C_LO+=("${T_LOCAL[$i]}"); C_RE+=("${T_REMOTE[$i]}")
+    C_PO+=("${T_POD[$i]}"); C_PI+=("${T_PID[$i]}"); C_ST+=("${T_STARTED[$i]}"); C_RS+=("${T_RESTARTS[$i]}")
+    C_LB+=("${T_LABEL[$i]}")
+    allkeys+="${T_KEY[$i]} "
+  done
+  mkdir -p "$STATE_DIR"
   local tmp; tmp="$STATE_DIR/tunnels.tsv.tmp"
   : >"$tmp"
-  for i in "${!T_KEY[@]}"; do
+  if [[ "$mode" != "replace" && -f "$(tw_state_file)" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      key="${line%%|*}"
+      case "$allkeys" in *" $key "*) continue ;; esac
+      printf '%s\n' "$line" >>"$tmp"
+    done <"$(tw_state_file)"
+  fi
+  for i in "${!C_KEY[@]}"; do
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-      "${T_KEY[$i]}" "${T_SLUG[$i]}" "${T_KIND[$i]}" "${T_DIR[$i]}" "${T_NS[$i]}" \
-      "${T_TARGET[$i]}" "${T_LOCAL[$i]}" "${T_REMOTE[$i]}" "${T_POD[$i]}" \
-      "${T_PID[$i]}" "${T_STARTED[$i]}" "${T_RESTARTS[$i]}" "${T_LABEL[$i]}" >>"$tmp"
+      "${C_KEY[$i]}" "${C_SLUG[$i]}" "${C_KIND[$i]}" "${C_DIR[$i]}" "${C_NS[$i]}" \
+      "${C_TGT[$i]}" "${C_LO[$i]}" "${C_RE[$i]}" "${C_PO[$i]}" \
+      "${C_PI[$i]}" "${C_ST[$i]}" "${C_RS[$i]}" "${C_LB[$i]}" >>"$tmp"
   done
   mv "$tmp" "$(tw_state_file)"
 }
@@ -916,6 +941,450 @@ tw_state_filter_slugs() { # slug... — drop loaded rows whose T_SLUG is not lis
   T_POD=("${PO[@]+${PO[@]}}"); T_PID=("${PI[@]+${PI[@]}}"); T_STARTED=("${ST[@]+${ST[@]}}"); T_RESTARTS=("${RS[@]+${RS[@]}}")
   T_LABEL=("${LB[@]+${LB[@]}}"); T_EP=("${EPi[@]+${EPi[@]}}")
   return 0
+}
+
+tw_state_filter_keys() { # key... — drop loaded rows whose T_KEY is not listed
+  local i k keep
+  for i in "${!T_KEY[@]}"; do
+    keep=0
+    for k in "$@"; do [[ "${T_KEY[$i]}" == "$k" ]] && { keep=1; break; }; done
+    [[ "$keep" -eq 1 ]] || T_EP[$i]="drop"
+  done
+  local j=0
+  local -a keep_idx=()
+  for i in "${!T_KEY[@]}"; do [[ "${T_EP[$i]}" != "drop" ]] && keep_idx+=("$i"); done
+  local -a K=() SL=() KI=() DI=() N=() TG=() LO=() RE=() PO=() PI=() ST=() RS=() LB=() EPi=()
+  for i in ${keep_idx[@]+"${keep_idx[@]}"}; do
+    K+=("${T_KEY[$i]}"); SL+=("${T_SLUG[$i]}"); KI+=("${T_KIND[$i]}"); DI+=("${T_DIR[$i]}")
+    N+=("${T_NS[$i]}"); TG+=("${T_TARGET[$i]}"); LO+=("${T_LOCAL[$i]}"); RE+=("${T_REMOTE[$i]}")
+    PO+=("${T_POD[$i]}"); PI+=("${T_PID[$i]}"); ST+=("${T_STARTED[$i]}"); RS+=("${T_RESTARTS[$i]}")
+    LB+=("${T_LABEL[$i]}"); EPi+=("${T_EP[$i]}")
+  done
+  tw_rows_reset
+  T_KEY=("${K[@]+${K[@]}}"); T_SLUG=("${SL[@]+${SL[@]}}"); T_KIND=("${KI[@]+${KI[@]}}"); T_DIR=("${DI[@]+${DI[@]}}")
+  T_NS=("${N[@]+${N[@]}}"); T_TARGET=("${TG[@]+${TG[@]}}"); T_LOCAL=("${LO[@]+${LO[@]}}"); T_REMOTE=("${RE[@]+${RE[@]}}")
+  T_POD=("${PO[@]+${PO[@]}}"); T_PID=("${PI[@]+${PI[@]}}"); T_STARTED=("${ST[@]+${ST[@]}}"); T_RESTARTS=("${RS[@]+${RS[@]}}")
+  T_LABEL=("${LB[@]+${LB[@]}}"); T_EP=("${EPi[@]+${EPi[@]}}")
+  return 0
+}
+
+# --- Tunnel profiles: daemon (background supervisor + web/API on 127.0.0.1) ---
+CPF_WEB_PORT="${CPF_WEB_PORT:-4321}"
+DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
+DAEMON_LOG="$STATE_DIR/daemon.log"
+DAEMON_LABEL="com.noizu.cluster-port-forward"
+SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+WEB_INDEX="$(resolve_share_file web/index.html "${CPF_WEB_INDEX:-}")"
+WEB_SERVER_PY="$(resolve_share_file web/server.py "${CPF_WEB_SERVER:-}")"
+
+# tw_api METHOD PATH [JSON-BODY] — body on stdout; TW_API_RC: 0 ok / 1 HTTP error / 2 unreachable
+# TW_API_HTTP_CODE: last HTTP status seen ("503" degraded, "400" rejected, "" unreachable)
+tw_api() {
+  local out rc tmo=90
+  TW_API_HTTP_CODE=""
+  [[ "$1" == "POST" && "$2" == "/api/up" ]] && tmo=3700  # server blocks on its up subprocess
+  out=$(python3 - "$CPF_WEB_PORT" "$1" "$2" "${3:-}" "$tmo" <<'PY'
+import sys, urllib.request, urllib.error
+port, method, path, body, tmo = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5])
+data = body.encode() if body else None
+req = urllib.request.Request("http://127.0.0.1:%s%s" % (port, path), data=data,
+                             method=method, headers={"Content-Type": "application/json"})
+try:
+    sys.stdout.write(urllib.request.urlopen(req, timeout=tmo).read().decode())
+except urllib.error.HTTPError as e:
+    sys.stdout.write(e.read().decode())
+    sys.exit(e.code)
+except Exception:
+    sys.exit(2)
+PY
+) && rc=0 || rc=$?
+  if [[ "$rc" == "2" ]]; then TW_API_RC=2
+  elif [[ "$rc" == "0" ]]; then TW_API_RC=0; TW_API_HTTP_CODE=200
+  else TW_API_RC=1; TW_API_HTTP_CODE="$rc"; fi
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  return 0
+}
+
+daemon_alive() {
+  [[ -f "$DAEMON_PID_FILE" ]] || return 1
+  is_alive "$(cat "$DAEMON_PID_FILE" 2>/dev/null || echo dead)"
+}
+
+daemon_web_up() {
+  tw_api GET /api/health >/dev/null
+  [[ "$TW_API_RC" -eq 0 ]]
+}
+
+api_json_escape() { # tiny string → JSON string (names/specs are validated downstream too)
+  local s="$1"
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/ }; s=${s//$'\r'/ }
+  printf '"%s"' "$s"
+}
+
+__daemon_rows_from_api() { # load T_* rows from the daemon /api/tunnels JSON
+  tw_rows_reset
+  local out tsv line
+  out=$(tw_api GET /api/tunnels) || true
+  [[ "$TW_API_RC" -eq 0 || "$TW_API_RC" -eq 1 ]] || return 1
+  tsv=$(python3 - "$out" <<'PY'
+import json, sys
+try:
+    v = json.loads(sys.argv[1])
+except ValueError:
+    sys.exit(0)
+for r in v.get("tunnels", []):
+    print("|".join(str(r.get(k, "")) for k in
+        ("key", "slug", "kind", "direction", "namespace", "target",
+         "local_port", "remote_port", "pod", "pid", "uptime", "restarts", "label")))
+PY
+) || return 1
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local -a c
+    IFS='|' read -ra c <<<"$line"
+    T_KEY+=("${c[0]:-}"); T_SLUG+=("${c[1]:-}"); T_KIND+=("${c[2]:-}"); T_DIR+=("${c[3]:-}")
+    T_NS+=("${c[4]:-}"); T_TARGET+=("${c[5]:-}"); T_LOCAL+=("${c[6]:-}"); T_REMOTE+=("${c[7]:-}")
+    T_POD+=("${c[8]:-}"); T_PID+=("${c[9]:-}"); T_STARTED+=("$(( $(date +%s) - ${c[10]:-0} ))")
+    T_RESTARTS+=("${c[11]:-0}"); T_LABEL+=("${c[12]:-}"); T_EP+=("-1")
+  done <<<"$tsv"
+}
+
+__daemon_loop() { # the always-on supervisor; owns ALL profile-tunnel children
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$$" >"$DAEMON_PID_FILE"
+  # kill the web/API child on every exit path — an orphaned server would keep
+  # the port bound and masquerade as the next daemon's API
+  tw_kill_web_child() {
+    [[ -f "$STATE_DIR/daemon-web.pid" ]] || return 0
+    local wpid; wpid=$(cat "$STATE_DIR/daemon-web.pid" 2>/dev/null)
+    [[ -n "$wpid" ]] && is_alive "$wpid" && kill "$wpid" 2>/dev/null
+    rm -f "$STATE_DIR/daemon-web.pid"
+    return 0
+  }
+  trap 'tw_stop_all || true; tw_kill_web_child; rm -f "$DAEMON_PID_FILE" || true; exit 0' INT TERM
+  trap 'tw_kill_web_child; rm -f "$DAEMON_PID_FILE" || true' EXIT
+  log "daemon starting (pid $$, port $CPF_WEB_PORT)"
+
+  # adopt existing state rows: respawn anything not alive (crash/launchd recovery)
+  tw_state_load
+  local i
+  for i in "${!T_KEY[@]}"; do
+    if [[ -z "${T_PID[$i]}" ]] || ! is_alive "${T_PID[$i]}"; then
+      if [[ "${T_DIR[$i]}" == "l2k" ]]; then tw_spawn_l2k "$i"; else tw_spawn_k2l "$i"; fi
+      T_STARTED[$i]=$(date +%s)
+    fi
+  done
+  tw_state_persist
+
+  # web/API server child (loopback-only; stdlib python)
+  if [[ -n "$WEB_SERVER_PY" && -f "$WEB_SERVER_PY" ]]; then
+    CPF_DAEMON_STATE="$(tw_state_file)" CPF_DAEMON_PID="$$" \
+    CPF_DAEMON_PROFILE="${CPF_DAEMON_PROFILE:-${TUNNEL_WATCHER_PROFILE:-}}" \
+    CPF_WEB_PORT="$CPF_WEB_PORT" CPF_WEB_BIN="$SELF_PATH" \
+    CPF_WEB_SHARE="$(dirname "$WEB_INDEX")" \
+      nohup python3 "$WEB_SERVER_PY" >>"$DAEMON_LOG" 2>&1 &
+    local webpid=$!
+    disown 2>/dev/null || true
+    printf '%s\n' "$webpid" >"$STATE_DIR/daemon-web.pid"
+    log "web ui serving http://127.0.0.1:$CPF_WEB_PORT"
+  else
+    warn "web server not found (share/web/server.py) — API disabled, supervision only"
+  fi
+
+  # supervision loop with per-key backoff (state reloaded each tick to pick up
+  # tunnels opened/closed through the API or other CLIs)
+  local -a DK=() DF=() DL=()
+  local key j jj fails lasttry backoff now
+  while :; do
+    tw_state_load
+    for i in "${!T_KEY[@]}"; do
+      key="${T_KEY[$i]}"
+      if tw_row_online "$i"; then
+        for jj in "${!DK[@]}"; do [[ "${DK[$jj]}" == "$key" ]] && DF[$jj]=0; done
+        continue
+      fi
+      j=-1
+      for jj in "${!DK[@]}"; do [[ "${DK[$jj]}" == "$key" ]] && { j=$jj; break; }; done
+      if (( j < 0 )); then j=${#DK[@]}; DK+=("$key"); DF+=(0); DL+=(0); fi
+      fails=${DF[$j]}; lasttry=${DL[$j]}
+      backoff=$(( POLL_SEC * (2 ** fails) )); (( backoff > 60 )) && backoff=60
+      now=$(date +%s)
+      if (( now - lasttry >= backoff )); then
+        warn "$key: restarting (backoff ${backoff}s)"
+        log "restart $key"
+        if [[ "${T_DIR[$i]}" == "l2k" ]]; then tw_spawn_l2k "$i"; else tw_spawn_k2l "$i"; fi
+        T_STARTED[$i]=$(date +%s)
+        T_RESTARTS[$i]=$(( $(tw_state_restarts_for "$key") + 1 ))
+        tw_state_persist
+        DF[$j]=$(( (fails + 1) > 6 ? 6 : fails + 1 )); DL[$j]=$now
+      fi
+    done
+    sleep "$POLL_SEC"
+  done
+}
+
+__daemon_start() {
+  if daemon_alive; then
+    ok "daemon already running (pid $(cat "$DAEMON_PID_FILE"))"
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 || fail "python3 not found — the daemon web/API needs it"
+  # refuse to start into an occupied port (a stale/foreign server there would
+  # answer our probes and masquerade as this daemon)
+  local bindwho
+  bindwho=$(lsof -nP -iTCP:"$CPF_WEB_PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" (pid "$2")"}') || true  # lsof rc1 = port free
+  if [[ -n "$bindwho" ]]; then
+    fail "port $CPF_WEB_PORT is already bound by ${bindwho} — not starting (4321 is Astro's dev-server default, that's the usual suspect; set CPF_WEB_PORT or stop that process, then: daemon start)"
+  fi
+  mkdir -p "$STATE_DIR"
+  nohup "$SELF_PATH" __daemon-loop >>"$DAEMON_LOG" 2>&1 &
+  local dpid=$!
+  disown 2>/dev/null || true
+  local n=0
+  while (( n < 24 )); do
+    is_alive "$dpid" || break
+    if daemon_web_up; then break; fi
+    sleep 0.25
+    n=$(( n + 1 ))
+  done
+  if daemon_alive && daemon_web_up; then
+    ok "daemon up (pid $dpid) — web UI on http://127.0.0.1:$CPF_WEB_PORT"
+  elif daemon_web_up; then
+    # web answers but our pidfile doesn't: a launchd-started instance won the
+    # boot race — defer to it (KILL our duplicate: its TERM trap would tear
+    # down the winning instance's shared tunnels)
+    local hpid
+    hpid=$(python3 - "$CPF_WEB_PORT" <<'PY'
+import sys, json, urllib.request
+try:
+    print(json.load(urllib.request.urlopen("http://127.0.0.1:%s/api/health" % sys.argv[1], timeout=5)).get("daemon_pid", ""))
+except Exception:
+    print("")
+PY
+)
+    kill -9 "$dpid" 2>/dev/null || true
+    if [[ -f "$STATE_DIR/daemon-web.pid" ]]; then
+      local wpid2; wpid2=$(cat "$STATE_DIR/daemon-web.pid" 2>/dev/null || echo "")
+      [[ -n "$wpid2" ]] && [[ "$wpid2" != "$hpid" ]] && kill -9 "$wpid2" 2>/dev/null
+      rm -f "$STATE_DIR/daemon-web.pid"
+    fi
+    printf '%s\n' "$hpid" >"$DAEMON_PID_FILE" 2>/dev/null || true
+    ok "daemon already running (pid ${hpid:-unknown} — launchd?) — not starting a second supervisor"
+  elif is_alive "$dpid"; then
+    warn "daemon process running (pid $dpid) but web API not answering yet — check $DAEMON_LOG"
+  else
+    fail "daemon failed to start — see $DAEMON_LOG"
+  fi
+}
+
+__daemon_stop() {
+  if [[ -f "$DAEMON_PID_FILE" ]]; then
+    local dpid; dpid=$(cat "$DAEMON_PID_FILE" 2>/dev/null || echo "")
+    if [[ -n "$dpid" ]] && is_alive "$dpid"; then
+      kill -TERM "$dpid" 2>/dev/null || true
+      local n=0
+      while is_alive "$dpid" && (( n < 20 )); do sleep 0.25; n=$(( n + 1 )); done
+      is_alive "$dpid" && kill -9 "$dpid" 2>/dev/null || true
+      ok "daemon stopped (pid $dpid) — its tunnels are torn down"
+    fi
+    # the web/API child is disowned — kill it explicitly if the TERM trap
+    # didn't get to it (crashed supervisor, KILL fallback)
+    if [[ -f "$STATE_DIR/daemon-web.pid" ]]; then
+      local wpid; wpid=$(cat "$STATE_DIR/daemon-web.pid" 2>/dev/null || echo "")
+      if [[ -n "$wpid" ]] && is_alive "$wpid"; then
+        kill "$wpid" 2>/dev/null || true
+        sleep 0.5
+        is_alive "$wpid" && kill -9 "$wpid" 2>/dev/null || true
+      fi
+      rm -f "$STATE_DIR/daemon-web.pid"
+    fi
+    rm -f "$DAEMON_PID_FILE"
+  else
+    info "daemon not running (no pidfile)"
+  fi
+}
+
+__daemon_install() {
+  local plist_dir="$HOME/Library/LaunchAgents"
+  local plist="$plist_dir/$DAEMON_LABEL.plist"
+  mkdir -p "$plist_dir" "$STATE_DIR"
+  cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$DAEMON_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$SELF_PATH</string>
+    <string>__daemon-loop</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$DAEMON_LOG</string>
+  <key>StandardErrorPath</key><string>$DAEMON_LOG</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>CPF_WEB_PORT</key><string>$CPF_WEB_PORT</string>
+    <key>TUNNEL_WATCHER_PROFILE</key><string>${TUNNEL_WATCHER_PROFILE:-noizu}</string>
+  </dict>
+</dict>
+</plist>
+EOF
+  ok "plist written: $plist"
+  if [[ "${CPF_NO_LAUNCHCTL:-}" == "1" ]]; then
+    info "CPF_NO_LAUNCHCTL=1 — skipping launchctl load"
+    return 0
+  fi
+  launchctl unload "$plist" >/dev/null 2>&1 || true
+  if launchctl load "$plist" 2>>"$DAEMON_LOG"; then
+    ok "loaded — daemon will start now and at every login (KeepAlive)"
+  else
+    fail "launchctl load failed — run: launchctl load $plist (or use: daemon start)"
+  fi
+}
+
+__daemon_uninstall() {
+  local plist="$HOME/Library/LaunchAgents/$DAEMON_LABEL.plist"
+  if [[ -f "$plist" && "${CPF_NO_LAUNCHCTL:-}" != "1" ]]; then
+    launchctl unload "$plist" >/dev/null 2>&1 || true
+  fi
+  rm -f "$plist" && ok "plist removed: $plist"
+  __daemon_stop
+}
+
+cmd_daemon() { # start|stop|restart|install|uninstall|status|logs
+  case "${1:-}" in
+    start) __daemon_start ;;
+    stop) __daemon_stop ;;
+    restart) __daemon_stop; sleep 0.5; __daemon_start ;;
+    install) __daemon_install ;;
+    uninstall) __daemon_uninstall ;;
+    status) __daemon_status ;;
+    logs)
+      if [[ -f "$DAEMON_LOG" ]]; then
+        tail -n 50 "$DAEMON_LOG"
+      else
+        info "no daemon log yet ($DAEMON_LOG)"
+      fi
+      ;;
+    *) fail "daemon: unknown action '${1:-}' (start|stop|restart|install|uninstall|status|logs)" ;;
+  esac
+}
+
+__daemon_status() {
+  if daemon_alive; then
+    ok "daemon running (pid $(cat "$DAEMON_PID_FILE"))"
+  else
+    warn "daemon not running — cluster-port-forward daemon start (or daemon install for always-on)"
+  fi
+  if daemon_web_up; then
+    info "web API healthy on 127.0.0.1:$CPF_WEB_PORT"
+  else
+    info "web API not answering on 127.0.0.1:$CPF_WEB_PORT"
+  fi
+  if launchctl list "$DAEMON_LABEL" >/dev/null 2>&1; then
+    info "launchd: $DAEMON_LABEL loaded ($( echo "$HOME/Library/LaunchAgents/$DAEMON_LABEL.plist"))"
+  else
+    info "launchd: not loaded (run: daemon install)"
+  fi
+}
+
+__api_stop_slugs() { # slug... — stop + remove every row of these slugs
+  [[ $# -gt 0 ]] || fail "__api-stop-slugs: no slugs"
+  tw_state_load
+  local i s keep
+  for i in "${!T_KEY[@]}"; do
+    keep=0
+    for s in "$@"; do [[ "${T_SLUG[$i]}" == "$s" ]] && { keep=1; break; }; done
+    [[ "$keep" -eq 1 ]] || continue
+    tw_stop_row "$i"
+  done
+  # rebuild rows without the stopped slugs, persist
+  local -a K=() SL=() KI=() DI=() N=() TG=() LO=() RE=() PO=() PI=() ST=() RS=() LB=()
+  for i in "${!T_KEY[@]}"; do
+    keep=0
+    for s in "$@"; do [[ "${T_SLUG[$i]}" == "$s" ]] && { keep=1; break; }; done
+    [[ "$keep" -eq 1 ]] && continue
+    K+=("${T_KEY[$i]}"); SL+=("${T_SLUG[$i]}"); KI+=("${T_KIND[$i]}"); DI+=("${T_DIR[$i]}")
+    N+=("${T_NS[$i]}"); TG+=("${T_TARGET[$i]}"); LO+=("${T_LOCAL[$i]}"); RE+=("${T_REMOTE[$i]}")
+    PO+=("${T_POD[$i]}"); PI+=("${T_PID[$i]}"); ST+=("${T_STARTED[$i]}"); RS+=("${T_RESTARTS[$i]}")
+    LB+=("${T_LABEL[$i]}")
+  done
+  tw_rows_reset
+  T_KEY=("${K[@]+${K[@]}}"); T_SLUG=("${SL[@]+${SL[@]}}"); T_KIND=("${KI[@]+${KI[@]}}"); T_DIR=("${DI[@]+${DI[@]}}")
+  T_NS=("${N[@]+${N[@]}}"); T_TARGET=("${TG[@]+${TG[@]}}"); T_LOCAL=("${LO[@]+${LO[@]}}"); T_REMOTE=("${RE[@]+${RE[@]}}")
+  T_POD=("${PO[@]+${PO[@]}}"); T_PID=("${PI[@]+${PI[@]}}"); T_STARTED=("${ST[@]+${ST[@]}}"); T_RESTARTS=("${RS[@]+${RS[@]}}")
+  T_LABEL=("${LB[@]+${LB[@]}}"); T_EP=("-1")
+  tw_state_persist replace   # removal — merge would resurrect the stopped rows
+  ok "stopped: $*"
+}
+
+__api_restart() { # slug — kill + respawn that slug's rows immediately
+  local slug="$1"; [[ -n "$slug" ]] || fail "restart: slug required"
+  tw_state_load
+  local i found=0
+  for i in "${!T_KEY[@]}"; do
+    [[ "${T_SLUG[$i]}" == "$slug" ]] || continue
+    found=1
+    tw_stop_row "$i"
+    if [[ "${T_DIR[$i]}" == "l2k" ]]; then tw_spawn_l2k "$i"; else tw_spawn_k2l "$i"; fi
+    T_STARTED[$i]=$(date +%s)
+    T_RESTARTS[$i]=$(( $(tw_state_restarts_for "${T_KEY[$i]}") + 1 ))
+  done
+  [[ "$found" -eq 1 ]] || fail "restart: no tunnel for slug '$slug'"
+  tw_state_persist
+  ok "restarting $slug"
+}
+
+__api_repoint() { # local_port pod — point the row owning local_port at pod/<pod>
+  local lp="$1" pod="$2"
+  [[ "$lp" =~ ^[0-9]+$ && "$pod" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || fail "repoint: bad arguments"
+  tw_state_load
+  local i idx=-1
+  for i in "${!T_KEY[@]}"; do [[ "${T_LOCAL[$i]}" == "$lp" ]] && { idx=$i; break; }; done
+  (( idx >= 0 )) || fail "repoint: no tunnel on local port $lp"
+  # validate the pod actually exists in the row's namespace (read-only get)
+  local found
+  found=$("${TW_KUBECTL[@]}" -n "${T_NS[$idx]}" get pods "$pod" -o custom-columns=NAME:.metadata.name 2>/dev/null | awk -v n="$pod" '$1==n{print $1; exit}') || true  # fixture/real kubectl rc1 = NotFound
+  [[ "$found" == "$pod" ]] || fail "repoint: pod '$pod' not found in namespace '${T_NS[$idx]}'"
+  tw_stop_row "$idx"
+  T_TARGET[$idx]="pod/$pod"
+  T_POD[$idx]="$pod"
+  if [[ "${T_DIR[$idx]}" == "l2k" ]]; then tw_spawn_l2k "$idx"; else tw_spawn_k2l "$idx"; fi
+  T_STARTED[$idx]=$(date +%s)
+  tw_state_persist
+  ok "repointed $lp → $pod"
+}
+
+__api_setport() { # slug port — persist default_port into the profile yaml, restart the default row
+  local slug="$1" port="$2"
+  [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && "$port" =~ ^[0-9]+$ ]] || fail "setport: bad arguments"
+  (( port % 2 == 0 )) || fail "setport: port must be even"
+  local prof="${TUNNEL_WATCHER_PROFILE:-${CPF_DAEMON_PROFILE:-noizu}}"
+  local ppath
+  ppath=$(pf_resolve_profile "$prof") || exit 1
+  pf_parse "$ppath"
+  local e found=0
+  for e in "${!EP_SLUG[@]}"; do
+    [[ "${EP_SLUG[$e]}" == "$slug" ]] && { found=1; break; }
+  done
+  [[ "$found" -eq 1 ]] || fail "setport: slug '$slug' not in profile '$prof'"
+  tw_profile_set_default_port "$ppath" "$slug" "$port" || fail "setport: profile edit failed"
+  tw_state_load
+  local i
+  for i in "${!T_KEY[@]}"; do
+    [[ "${T_KEY[$i]}" == "tw-$slug" ]] || continue
+    tw_stop_row "$i"
+    T_LOCAL[$i]="$port"
+    if [[ "${T_DIR[$i]}" == "l2k" ]]; then tw_spawn_l2k "$i"; else tw_spawn_k2l "$i"; fi
+    T_STARTED[$i]=$(date +%s)
+  done
+  tw_state_persist
+  ok "set $slug default_port=$port (persisted to $ppath)"
 }
 
 tw_state_restarts_for() {
@@ -1138,6 +1607,42 @@ cmd_up() {
     done
     [[ $json -eq 1 ]] && tw_print_json plan
     exit 0
+  fi
+
+  # daemon-client path (plain up): the always-on supervisor owns the tunnels.
+  # CPF_API_INTERNAL=1 marks CLI processes the web server exec'd — they must run
+  # the local supervisor below, never re-post to the API (infinite recursion).
+  if [[ $watch -eq 0 && $tui -eq 0 && "${CPF_API_INTERNAL:-}" != "1" ]]; then
+    tw_api GET /api/health >/dev/null
+    if [[ "$TW_API_RC" -eq 2 ]]; then
+      fail "daemon not running — cluster-port-forward daemon start (or daemon install for always-on)"
+    fi
+    local inc_json="" s body api_out planned=" "
+    for i in "${!T_KEY[@]}"; do planned+="${T_KEY[$i]} "; done
+    for s in ${spec_args[@]+"${spec_args[@]}"}; do
+      inc_json+="${inc_json:+,}$(api_json_escape "$s")"
+    done
+    body="{\"profile\":$(api_json_escape "${prof:-}"),\"include\":[${inc_json}],\"timeout\":$(api_json_escape "$tw_timeout")}"
+    api_out=$(tw_api POST /api/up "$body")
+    if [[ "$TW_API_RC" -eq 2 ]]; then
+      fail "daemon went away mid-up — cluster-port-forward daemon start"
+    fi
+    if [[ "$TW_API_RC" -eq 1 && "$TW_API_HTTP_CODE" != "503" ]]; then
+      # hard rejection (bad request etc.) — nothing was spawned; surface it
+      local errmsg
+      errmsg=$(printf '%s' "$api_out" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("error", "up failed"))
+except Exception: print("up failed")' 2>/dev/null)
+      errmsg="${errmsg:-up failed}"
+      fail "up via daemon rejected: $errmsg"
+    fi
+    tw_state_load
+    tw_state_filter_keys ${planned}
+    if [[ $json -eq 1 ]]; then tw_print_json live; else tw_print_table live; fi
+    local rc=0
+    for i in "${!T_KEY[@]}"; do tw_row_online "$i" || rc=1; done
+    [[ $rc -eq 0 ]] || warn "not all tunnels online (daemon keeps supervising; check cluster-port-forward status)"
+    exit "$rc"
   fi
 
   for i in "${!T_KEY[@]}"; do
@@ -1532,19 +2037,25 @@ cmd_status() { # [--profile P] — legacy catalog table + profile-tunnel section
     printf '%-16s %-8s %-14s %-14s %s\n' "$name" "$old" "$loopb" "$bindst" "$state"
   done
   printf '%s\n' '--- tunnel profiles (up/tui) ---'
-  if [[ ! -f "$(tw_state_file)" ]]; then
-    info "no tunnel sessions (state dir: $STATE_DIR) (try: cluster-port-forward up --profile noizu)"
-    return 0
-  fi
-  tw_state_load
+  {
+    # daemon source preferred: same rows the web UI/TUI show, incl. its pids
+    if daemon_web_up && __daemon_rows_from_api; then
+      :
+    elif [[ -f "$(tw_state_file)" ]]; then
+      tw_state_load
+    else
+      info "no tunnel sessions (state dir: $STATE_DIR) (try: cluster-port-forward up --profile noizu)"
+      return 0
+    fi
+  } || true
   if [[ -n "$prof_arg" ]]; then
-    local ppath pslug
+    local ppath
     ppath=$(pf_resolve_profile "$prof_arg") || exit 1
     pf_parse "$ppath"
     tw_state_filter_slugs ${EP_SLUG[@]+"${EP_SLUG[@]}"}
   fi
   if [[ ${#T_KEY[@]} -eq 0 ]]; then
-    info 'no tunnel sessions (try: cluster-port-forward up --profile noizu)'
+    info "no tunnel sessions (state dir: $STATE_DIR) (try: cluster-port-forward up --profile noizu)"
   else
     tw_print_table live
   fi
@@ -1566,6 +2077,22 @@ cmd_start() {
 }
 
 cmd_stop() {
+  # daemon path: the supervisor owns profile tunnels — route through the API
+  # (skipped for server-exec'd CLI: CPF_API_INTERNAL prevents API recursion)
+  if [[ "${CPF_API_INTERNAL:-}" != "1" ]] && daemon_web_up; then
+    if [[ $# -eq 0 || "${1:-}" == all ]]; then
+      tw_api POST /api/down '{"all":true}' >/dev/null
+      [[ "$TW_API_RC" -eq 0 ]] || fail "daemon down-all failed"
+      info "stopped all tunnels via daemon"
+    else
+      local slugs_json="" s
+      for s in "$@"; do slugs_json+="${slugs_json:+,}$(api_json_escape "$s")"; done
+      tw_api POST /api/down "{\"slug\":[${slugs_json}]}" >/dev/null
+      [[ "$TW_API_RC" -eq 0 ]] || fail "daemon stop failed for: $*"
+      info "stopped ($*) via daemon"
+    fi
+    return 0
+  fi
   load_catalog
   local -a sel
   if [[ $# -eq 0 || "${1:-}" == all ]]; then
@@ -1674,6 +2201,49 @@ cmd_doctor() {
     fi
   done
   [[ $found -eq 0 ]] && info "no active l2k sessions to probe"
+
+  # --- daemon / web UI ---------------------------------------------------------
+  echo "--- daemon ---"
+  if daemon_alive; then
+    ok "daemon running (pid $(cat "$DAEMON_PID_FILE" 2>/dev/null))"
+  else
+    info "daemon not running — cluster-port-forward daemon start (or daemon install for always-on)"
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    local bindwho
+    bindwho=$(lsof -nP -iTCP:"$CPF_WEB_PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" (pid "$2")"}') || true  # lsof rc1 = port free
+    if daemon_web_up; then
+      ok "web API healthy on 127.0.0.1:$CPF_WEB_PORT"
+    elif [[ -n "$bindwho" ]]; then
+      warn "port $CPF_WEB_PORT is bound by another process: ${bindwho:-unknown}"
+      warn "  (4321 is Astro's dev-server default — that's the usual suspect)"
+      warn "  set CPF_WEB_PORT or stop that process, then: daemon restart"
+    else
+      info "web API not running on 127.0.0.1:$CPF_WEB_PORT"
+    fi
+  fi
+  if [[ -f "$HOME/Library/LaunchAgents/$DAEMON_LABEL.plist" ]]; then
+    if [[ "${CPF_NO_LAUNCHCTL:-}" != "1" ]] && launchctl list "$DAEMON_LABEL" >/dev/null 2>&1; then
+      ok "launchd: $DAEMON_LABEL loaded (starts at login, KeepAlive)"
+    else
+      info "launchd plist present but not loaded — run: daemon install"
+    fi
+  else
+    info "launchd: no plist (run: daemon install for always-on supervision)"
+  fi
+  if daemon_web_up; then
+    local ui_rc
+    python3 - "$CPF_WEB_PORT" <<'PY' 2>/dev/null && ui_rc=0 || ui_rc=1
+import sys, urllib.request
+try:
+    r = urllib.request.urlopen("http://127.0.0.1:%s/" % sys.argv[1], timeout=5)
+    sys.exit(0 if r.status == 200 else 1)
+except Exception:
+    sys.exit(1)
+PY
+    [[ "$ui_rc" -eq 0 ]] && ok "web UI serves 200 at http://127.0.0.1:$CPF_WEB_PORT/" \
+      || warn "web UI did not serve 200"
+  fi
   return 0
 }
 
@@ -1690,9 +2260,15 @@ main() {
   case "$cmd" in
     start)   cmd_start "$@" ;;
     stop)    cmd_stop "$@" ;;
-    watch|supervise|daemon) cmd_watch "$@" ;;
+    watch|supervise) cmd_watch "$@" ;;
     up)      shift 0; cmd_up "$@" ;;
     tui)     cmd_tui "$@" ;;
+    daemon)  shift 0; cmd_daemon "$@" ;;
+    __daemon-loop) shift 0; __daemon_loop ;;
+    __api-stop-slugs) shift 0; __api_stop_slugs "$@" ;;
+    __api-restart) shift 0; __api_restart "${1:-}" ;;
+    __api-repoint) shift 0; __api_repoint "${1:-}" "${2:-}" ;;
+    __api-setport) shift 0; __api_setport "${1:-}" "${2:-}" ;;
     profile-parse) # debug: parse a profile and dump normalized endpoints
       local pp
       pp=$(pf_resolve_profile "${1:-${TUNNEL_WATCHER_PROFILE:-}}") || exit 1

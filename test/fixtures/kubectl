@@ -81,12 +81,18 @@ case "$SUB" in
         fi
         prev="$a"
       done
-      # `get pods <name> -o custom-columns=...` (single pod)
+      # `get pods <name> -o custom-columns=...` (single pod) — mirror real
+      # kubectl: an unknown pod name is NotFound (this is what repoint relies on)
       prev=""
       for a in "$@"; do
-        if [[ "$prev" == "pods" && "$a" != -* && "$a" != custom-columns* && "$a" != "$NS" ]]; then
-          printf 'NAME\n%s\n' "$a"
-          exit 0
+        if [[ "$prev" == "pods" && "$a" != -* && "$a" != custom-columns* ]]; then
+          f="$FIX/pods_${NS}${FAKE_PODS_SUFFIX:-}.txt"
+          if [[ -f "$f" ]] && awk -v n="$a" '$1==n{found=1} END{exit found?0:1}' "$f"; then
+            printf 'NAME\n%s\n' "$a"
+            exit 0
+          fi
+          echo "Error from server (NotFound): pods \"$a\" not found" >&2
+          exit 1
         fi
         prev="$a"
       done

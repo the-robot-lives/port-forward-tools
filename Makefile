@@ -12,6 +12,9 @@ install:
 	@install -m 644 share/local-dev-hosts.md $(SHARE_DIR)/local-dev-hosts.md
 	@install -m 644 share/sudoers.d-noizu-local-dev $(SHARE_DIR)/sudoers.d-noizu-local-dev
 	@install -m 644 share/profiles/noizu.yaml.example $(SHARE_DIR)/profiles/noizu.yaml.example
+	@mkdir -p $(SHARE_DIR)/web
+	@install -m 644 share/web/index.html $(SHARE_DIR)/web/index.html
+	@install -m 755 share/web/server.py $(SHARE_DIR)/web/server.py
 	@mkdir -p $(HOME)/.config/tunnel-watcher
 	@if [ ! -f $(HOME)/.config/tunnel-watcher/noizu.yaml ]; then \
 		install -m 644 share/profiles/noizu.yaml.example $(HOME)/.config/tunnel-watcher/noizu.yaml; \
