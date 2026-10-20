@@ -313,6 +313,54 @@ assert_contains "help shows up" "$out" "up [--profile P]"
 assert_contains "help shows tui" "$out" "cluster-port-forward tui"
 assert_contains "help shows specs" "$out" "slug-num-N"
 
+# --- 13. regressions: tui --profile, flag-position hint, status profile section -
+seed_state() {
+  local now; now=$(date +%s)
+  {
+    printf 'tw-valkey|valkey|service|k2l|apps|svc/app-valkey|6308|6379|||%d|0|default\n' "$now"
+    printf 'tw-valkey-n1|valkey|service|k2l|apps|pod/app-valkey-aaa1|6314|6379|||%d|0|n1\n' "$now"
+    printf 'tw-ghost|ghost|service|k2l|apps|svc/ghost|6600|6379|||%d|0|default\n' "$now"
+  } >"$SB_RUN/tunnels.tsv"
+}
+seed_state
+
+# tui honors --profile without the env var (defect: flag was ignored entirely)
+out=$({ unset TUNNEL_WATCHER_PROFILE; cpf tui --profile noizu </dev/null; } 2>&1); rc=$?
+assert_rc "tui --profile rc" 0 "$rc"
+assert_contains "tui --profile renders rows" "$out" "tw-valkey"
+assert_not_contains "tui --profile no refusal" "$out" "no profile given"
+
+out=$({ unset TUNNEL_WATCHER_PROFILE; cpf tui </dev/null; } 2>&1 >/dev/null); rc=$?
+assert_rc "tui no-profile refusal rc" 1 "$rc"
+assert_contains "tui no-profile refusal msg" "$out" "no profile"
+
+# global flags before the subcommand get the positional hint (defect: bare "Unknown command")
+err=$(cpf --profile noizu tui 2>&1 >/dev/null); rc=$?
+assert_rc "flag-before-subcommand rc" 1 "$rc"
+assert_contains "flag-before-subcommand hint" "$err" "flags go after the subcommand"
+
+# status renders the profile-tunnel section from seeded state
+seed_state
+out=$(cpf status 2>&1); rc=$?
+assert_rc "status with state rc" 0 "$rc"
+assert_contains "status profile header" "$out" "--- tunnel profiles (up/tui) ---"
+assert_contains "status shows tw-valkey" "$out" "tw-valkey"
+assert_contains "status shows foreign slug" "$out" "tw-ghost"
+
+# status --profile filters to that profile's slugs
+out=$({ unset TUNNEL_WATCHER_PROFILE; cpf status --profile noizu; } 2>&1); rc=$?
+assert_rc "status --profile rc" 0 "$rc"
+assert_contains "status --profile keeps valkey" "$out" "tw-valkey"
+assert_not_contains "status --profile drops foreign" "$out" "tw-ghost"
+
+# no state file → section always renders, names the state dir (env-split tell)
+# (call the binary directly: the cpf() wrapper would override CPF_STATE_DIR)
+out=$(CPF_STATE_DIR="$SANDBOX/no-such-state" "$BIN" status 2>&1); rc=$?
+assert_rc "status no-state rc" 0 "$rc"
+assert_contains "status no-state header" "$out" "--- tunnel profiles (up/tui) ---"
+assert_contains "status no-state names dir" "$out" "no tunnel sessions (state dir:"
+cpf stop all >/dev/null 2>&1
+
 # --- summary -------------------------------------------------------------------
 echo
 echo "passed: $PASS  failed: $FAIL"

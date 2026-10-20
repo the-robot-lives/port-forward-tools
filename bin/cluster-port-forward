@@ -882,8 +882,6 @@ tw_rows_reset() {
 
 tw_state_load() {
   tw_rows_reset
-  T_KEY=(); T_SLUG=(); T_KIND=(); T_DIR=(); T_NS=(); T_TARGET=(); T_LOCAL=(); T_REMOTE=()
-  T_POD=(); T_LABEL=(); T_EP=(); T_STARTED=(); T_RESTARTS=(); T_PID=()
   local f line
   f="$(tw_state_file)"
   [[ -f "$f" ]] || return 0
@@ -896,6 +894,28 @@ tw_state_load() {
     T_POD+=("${c[8]:-}"); T_PID+=("${c[9]:-}"); T_STARTED+=("${c[10]:-0}"); T_RESTARTS+=("${c[11]:-0}")
     T_LABEL+=("${c[12]:-}"); T_EP+=("-1")
   done <"$f"
+}
+
+tw_state_filter_slugs() { # slug... — drop loaded rows whose T_SLUG is not listed
+  local i s keep
+  local -a K=() SL=() KI=() DI=() N=() TG=() LO=() RE=() PO=() PI=() ST=() RS=() LB=() EPi=()
+  for i in "${!T_KEY[@]}"; do
+    keep=0
+    for s in "$@"; do
+      [[ "${T_SLUG[$i]}" == "$s" ]] && { keep=1; break; }
+    done
+    [[ "$keep" -eq 1 ]] || continue
+    K+=("${T_KEY[$i]}"); SL+=("${T_SLUG[$i]}"); KI+=("${T_KIND[$i]}"); DI+=("${T_DIR[$i]}")
+    N+=("${T_NS[$i]}"); TG+=("${T_TARGET[$i]}"); LO+=("${T_LOCAL[$i]}"); RE+=("${T_REMOTE[$i]}")
+    PO+=("${T_POD[$i]}"); PI+=("${T_PID[$i]}"); ST+=("${T_STARTED[$i]}"); RS+=("${T_RESTARTS[$i]}")
+    LB+=("${T_LABEL[$i]}"); EPi+=("${T_EP[$i]}")
+  done
+  tw_rows_reset
+  T_KEY=("${K[@]+${K[@]}}"); T_SLUG=("${SL[@]+${SL[@]}}"); T_KIND=("${KI[@]+${KI[@]}}"); T_DIR=("${DI[@]+${DI[@]}}")
+  T_NS=("${N[@]+${N[@]}}"); T_TARGET=("${TG[@]+${TG[@]}}"); T_LOCAL=("${LO[@]+${LO[@]}}"); T_REMOTE=("${RE[@]+${RE[@]}}")
+  T_POD=("${PO[@]+${PO[@]}}"); T_PID=("${PI[@]+${PI[@]}}"); T_STARTED=("${ST[@]+${ST[@]}}"); T_RESTARTS=("${RS[@]+${RS[@]}}")
+  T_LABEL=("${LB[@]+${LB[@]}}"); T_EP=("${EPi[@]+${EPi[@]}}")
+  return 0
 }
 
 tw_state_restarts_for() {
@@ -1183,8 +1203,15 @@ tw_supervise() {
 }
 
 # --- Tunnel profiles: TUI -----------------------------------------------------
-cmd_tui() {
+cmd_tui() { # [--profile P]
   local prof="${TUNNEL_WATCHER_PROFILE:-}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile) [[ -n "${2:-}" ]] || fail "tui: --profile needs a value"; prof="$2"; shift 2 ;;
+      --profile=*) prof="${1#*=}"; shift ;;
+      *) fail "tui: unknown flag: $1 (usage: cluster-port-forward tui [--profile P])" ;;
+    esac
+  done
   local ppath
   ppath=$(pf_resolve_profile "$prof") || exit 1
   pf_parse "$ppath"
@@ -1473,7 +1500,15 @@ cmd_list() {
   done
 }
 
-cmd_status() {
+cmd_status() { # [--profile P] — legacy catalog table + profile-tunnel section
+  local prof_arg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile) [[ -n "${2:-}" ]] || fail "status: --profile needs a value"; prof_arg="$2"; shift 2 ;;
+      --profile=*) prof_arg="${1#*=}"; shift ;;
+      *) fail "status: unknown flag: $1 (usage: cluster-port-forward status [--profile P])" ;;
+    esac
+  done
   load_catalog
   printf '%-16s %-8s %-14s %-14s %s\n' "NAME" "PID" "LOOPBACK" "BIND" "STATE"
   local i name lp bip bp pidf old state loopb bindst
@@ -1496,14 +1531,22 @@ cmd_status() {
     fi
     printf '%-16s %-8s %-14s %-14s %s\n' "$name" "$old" "$loopb" "$bindst" "$state"
   done
-  if [[ -f "$(tw_state_file)" ]]; then
-    printf '%s\n' '--- tunnel profiles (up/tui) ---'
-    tw_state_load
-    if [[ ${#T_KEY[@]} -eq 0 ]]; then
-      info 'no tunnel sessions (try: cluster-port-forward up --profile noizu)'
-    else
-      tw_print_table live
-    fi
+  printf '%s\n' '--- tunnel profiles (up/tui) ---'
+  if [[ ! -f "$(tw_state_file)" ]]; then
+    info "no tunnel sessions (state dir: $STATE_DIR) (try: cluster-port-forward up --profile noizu)"
+    return 0
+  fi
+  tw_state_load
+  if [[ -n "$prof_arg" ]]; then
+    local ppath pslug
+    ppath=$(pf_resolve_profile "$prof_arg") || exit 1
+    pf_parse "$ppath"
+    tw_state_filter_slugs ${EP_SLUG[@]+"${EP_SLUG[@]}"}
+  fi
+  if [[ ${#T_KEY[@]} -eq 0 ]]; then
+    info 'no tunnel sessions (try: cluster-port-forward up --profile noizu)'
+  else
+    tw_print_table live
   fi
 }
 
@@ -1663,12 +1706,15 @@ main() {
           "${EP_DEFAULT_INSTANCE[$pi]:-}" "${EP_LOCAL_PORT[$pi]:-}" "${EP_REMOTE_PORT[$pi]:-}"
       done
       ;;
-    status|st) cmd_status ;;
+    status|st) cmd_status "$@" ;;
     list|ls) cmd_list ;;
     doctor|check) cmd_doctor ;;
     hosts)   cmd_hosts "$@" ;;
     aliases|alias) cmd_aliases "$@" ;;
     -h|--help|help|"") usage 0 ;;
+    -*)
+      fail "flags go after the subcommand — got '$cmd' (usage: cluster-port-forward <command> [flags]; e.g. cluster-port-forward tui --profile noizu)"
+      ;;
     *) fail "Unknown command: $cmd (try --help)" ;;
   esac
 }
