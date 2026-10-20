@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# test fixture kubectl — canned responses from test/fixtures; NEVER touches a cluster.
+# Behaviour knobs:
+#   FAKE_KUBE_BIND=1   port-forward actually listens (nc loop) instead of sleeping
+# FIXTURES must point at the fixtures dir.
+set -u
+FIX="${FIXTURES:?FIXTURES not set}"
+
+find_arg_after() { # $1=flag, rest=args → value or ""
+  local flag="$1"; shift
+  local i
+  for i in "$@"; do :; done
+  local prev=""
+  for i in "$@"; do
+    if [[ "$prev" == "$flag" ]]; then echo "$i"; return 0; fi
+    prev="$i"
+  done
+  return 1
+}
+
+has_flag() { local f="$1"; shift; local a; for a in "$@"; do [[ "$a" == "$f" ]] && return 0; done; return 1; }
+
+# subcommand = first non-flag-ish token; values of --* flags and -n are skipped
+SUB=""
+prev=""
+for a in "$@"; do
+  case "$a" in
+    --*) prev="flagval"; continue ;;
+    -n) prev="-n"; continue ;;
+    *)
+      if [[ "$prev" == "flagval" || "$prev" == "-n" ]]; then prev=""; continue; fi
+      [[ -z "$SUB" ]] && SUB="$a"
+      ;;
+  esac
+  prev="$a"
+done
+
+case "$SUB" in
+  cluster-info) echo "fake cluster is fake"; exit 0 ;;
+  get)
+    if has_flag "nodes" "$@"; then
+      # only the node-address jsonpath form is served
+      cat "$FIX/nodes.jsonpath"
+      exit 0
+    fi
+    if has_flag "ns" "$@"; then
+      cat "$FIX/namespaces.txt"
+      exit 0
+    fi
+    NS="$(find_arg_after -n "$@" || echo default)"
+    if has_flag "svc" "$@"; then
+      if has_flag "-o" "$@"; then
+        # jsonpath selector form: get svc <name> -o jsonpath=...
+        local_name=""
+        prev=""
+        for a in "$@"; do
+          if [[ "$prev" == "svc" && "$a" != -o* ]]; then local_name="$a"; break; fi
+          prev="$a"
+        done
+        f="$FIX/svc-selector_${NS}_${local_name}.txt"
+        if [[ -f "$f" ]]; then cat "$f"; exit 0; fi
+        echo '{}' ; exit 0
+      fi
+      exit 0  # doctor-style existence probe
+    fi
+    if has_flag "deploy" "$@"; then
+      echo '{}'; exit 0
+    fi
+    if has_flag "pods" "$@"; then
+      # mirror real kubectl: a -l selector must be k=v form; k:v (the classic
+      # jsonpath-map bug) is a BadRequest — this keeps the fixture honest about
+      # selector shape so the tool's selector normalization is actually tested.
+      prev=""
+      for a in "$@"; do
+        if [[ "$prev" == "-l" ]]; then
+          if [[ "$a" != *"="* ]]; then
+            echo "Error from server (BadRequest): Unable to parse requirement: Invalid value: \"$a\": name part must consist of alphanumeric characters, '-', '_' or '.' (did you forget k=v?)" >&2
+            exit 1
+          fi
+          break
+        fi
+        prev="$a"
+      done
+      # `get pods <name> -o custom-columns=...` (single pod)
+      prev=""
+      for a in "$@"; do
+        if [[ "$prev" == "pods" && "$a" != -* && "$a" != custom-columns* && "$a" != "$NS" ]]; then
+          printf 'NAME\n%s\n' "$a"
+          exit 0
+        fi
+        prev="$a"
+      done
+      f="$FIX/pods_${NS}${FAKE_PODS_SUFFIX:-}.txt"
+      if [[ -f "$f" ]]; then cat "$f"; exit 0; fi
+      printf 'NAME\n'
+      exit 0
+    fi
+    exit 0
+    ;;
+  port-forward)
+    # kubectl ... -n NS port-forward TARGET --address 127.0.0.1 LP:RP
+    if [[ "${FAKE_KUBE_BIND:-}" == "1" ]]; then
+      lp_rp=""
+      prev=""
+      for a in "$@"; do
+        if [[ "$prev" == "127.0.0.1" ]]; then lp_rp="$a"; break; fi
+        prev="$a"
+      done
+      lp="${lp_rp%%:*}"
+      while true; do
+        nc -l 127.0.0.1 "$lp" >/dev/null 2>&1 || sleep 0.1
+      done
+    else
+      # alive but never binds; bounded life so crashed runs self-clean
+      sleep 300
+    fi
+    ;;
+  *) echo "fake kubectl: unhandled: $*" >&2; exit 1 ;;
+esac

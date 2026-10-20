@@ -1,0 +1,4 @@
+profile: t
+endpoints:
+  - slug: x
+    default_port: [1,2]

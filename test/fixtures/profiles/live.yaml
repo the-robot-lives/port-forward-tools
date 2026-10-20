@@ -1,0 +1,7 @@
+profile: live
+endpoints:
+  - slug: lv
+    namespace: apps
+    service: app-valkey
+    default_port: 64108
+    instances: true

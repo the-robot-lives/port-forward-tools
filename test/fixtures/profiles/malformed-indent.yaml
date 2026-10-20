@@ -1,0 +1,4 @@
+profile: t
+endpoints:
+  - slug: x
+   namespace: apps

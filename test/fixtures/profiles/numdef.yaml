@@ -1,0 +1,8 @@
+profile: numdef
+endpoints:
+  - slug: nd
+    namespace: apps
+    service: app-valkey
+    default_port: 6500
+    instances: true
+    default_instance: num-2

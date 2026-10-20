@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# test fixture ssh — records argv, canned replies; NEVER opens a real connection.
+set -u
+[[ -n "${FAKE_SSH_LOG:-}" ]] && printf '%s\n' "$*" >>"$FAKE_SSH_LOG"
+
+case "$*" in
+  *"BatchMode=yes"*" true"*) exit "${FAKE_SSH_REACH_RC:-0}" ;;
+  *gatewayports*)
+    printf '%s\n' "${FAKE_SSH_GATEWAYPORTS:-}"
+    exit 0
+    ;;
+  -N*)
+    # reverse-tunnel child: stay alive without doing anything (bounded, self-cleans)
+    sleep 300
+    ;;
+  *) exit 0 ;;
+esac

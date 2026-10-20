@@ -1,0 +1,6 @@
+NAME                          PHASE
+app-valkey-aaa1              Running
+app-valkey-bbb2              Running
+app-valkey-ccc3              Running
+app-valkey-ddd4              Running
+app-valkey-eee5              Running
