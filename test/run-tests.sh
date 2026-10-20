@@ -15,7 +15,11 @@ FAILED_NAMES=()
 SANDBOX="$(mktemp -d)"
 cleanup() {
   [[ -n "${LISTENER_PID:-}" ]] && kill "$LISTENER_PID" 2>/dev/null || true
-  CPF_STATE_DIR="$SB_RUN" "$BIN" stop all >/dev/null 2>&1 || true
+  CPF_WEB_PORT=4499 CPF_STATE_DIR="$SB_RUN" "$BIN" daemon stop >/dev/null 2>&1 || true
+  CPF_WEB_PORT=4498 CPF_STATE_DIR="$SB_RUN-plain" "$BIN" daemon stop >/dev/null 2>&1 || true
+  CPF_WEB_PORT=4497 CPF_STATE_DIR="$SB_RUN-surv" "$BIN" daemon stop >/dev/null 2>&1 || true
+  pkill -f "$BIN __daemon-loop" 2>/dev/null || true
+  pkill -f "$HERE/../share/web/server.py" 2>/dev/null || true
   rm -rf "$SANDBOX"
 }
 trap cleanup EXIT
@@ -50,10 +54,37 @@ preclean() {
   done
   pkill -f "$HERE/fixtures/kubectl" 2>/dev/null || true
   pkill -f "$HERE/fixtures/ssh" 2>/dev/null || true
+  pkill -f "$BIN __daemon-loop" 2>/dev/null || true
+  pkill -f "$HERE/../share/web/server.py" 2>/dev/null || true
+  local port spid
+  for port in 4497 4498 4499; do
+    for spid in $(lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null); do
+      case "$(ps -o command= -p "$spid" 2>/dev/null)" in
+        *cluster-port-forward*|*server.py*) kill "$spid" 2>/dev/null || true ;;
+      esac
+    done
+  done
   sleep 0.3
   return 0
 }
 preclean
+
+# --- test daemons: the CLI `up`/`stop`/`status` surface talks to the daemon ----
+# 4499 = bind-mode daemon (default; fake port-forwards actually listen)
+# 4498 = plain daemon (never-binding forwards → the timeout/offline path)
+# started AFTER preclean — preclean kills anything on our ports by design
+export CPF_WEB_PORT=4499
+_start_out=$(FAKE_KUBE_BIND=1 CPF_STATE_DIR="$SB_RUN" "$BIN" daemon start 2>&1) \
+  || { echo "FATAL: bind-mode test daemon failed to start:"; echo "$_start_out"; exit 1; }
+_start_out=$(CPF_WEB_PORT=4498 CPF_STATE_DIR="$SB_RUN-plain" "$BIN" daemon start 2>&1) \
+  || { echo "FATAL: plain test daemon failed to start:"; echo "$_start_out"; exit 1; }
+unset _start_out
+# dedicated port range for the plain (never-binding) daemon — the bind daemon's
+# children hold 6308..6322, and an already-open local port is legitimately
+# treated as an online external forward
+sed 's/default_port: 6308/default_port: 64308/' \
+  "$HOME/.config/tunnel-watcher/noizu.yaml" > "$HOME/.config/tunnel-watcher/plain.yaml"
+export CPF_WEB_PORT=4499
 
 assert_eq() { # desc got want
   if [[ "$2" == "$3" ]]; then PASS=$((PASS + 1)); else
@@ -234,13 +265,19 @@ assert_contains "collision kept n2" "$out" '"local_port":6998'
 n7000=$(printf '%s' "$out" | grep -oF '"local_port":7000' | wc -l | tr -d ' ')
 assert_eq "collision n3 dropped (one 7000 = alpha default)" "$n7000" "1"
 
-# --- 8. timeout path (never-binding fake) → exit 1 -----------------------------
+# --- 8. timeout path (never-binding fake, own port range) → exit 1 -------------
+# ("$BIN" direct: the cpf() wrapper would override the CPF_STATE_DIR prefix)
 t0=$(date +%s)
-out=$(cpf up --include valkey --timeout 1 2>&1); rc=$?
+out=$(CPF_WEB_PORT=4498 CPF_STATE_DIR="$SB_RUN-plain" "$BIN" up --profile plain --include valkey --timeout 1 2>&1); rc=$?
 t1=$(date +%s)
 assert_rc "timeout rc" 1 "$rc"
 assert_contains "timeout row offline" "$out" "offline"
 (( t1 - t0 <= 15 )) && PASS=$((PASS + 1)) || { FAIL=$((FAIL + 1)); FAILED_NAMES+=("timeout duration"); echo "FAIL: timeout took $((t1 - t0))s"; }
+
+# daemon unreachable → loud refusal with fix hint (no silent local supervisor)
+err=$(CPF_WEB_PORT=4490 cpf up --include valkey --timeout 1 2>&1 >/dev/null); rc=$?
+assert_rc "up no-daemon refusal rc" 1 "$rc"
+assert_contains "up no-daemon hint" "$err" "daemon not running"
 
 err=$(cpf up --dry-run --timeout bogus 2>&1 >/dev/null); rc=$?
 assert_rc "bad duration rc" 1 "$rc"
@@ -355,11 +392,115 @@ assert_not_contains "status --profile drops foreign" "$out" "tw-ghost"
 
 # no state file → section always renders, names the state dir (env-split tell)
 # (call the binary directly: the cpf() wrapper would override CPF_STATE_DIR)
-out=$(CPF_STATE_DIR="$SANDBOX/no-such-state" "$BIN" status 2>&1); rc=$?
+# no state file → section always renders, names the state dir (env-split tell).
+# also point CPF_WEB_PORT at a dead port: with a live daemon the rows come from
+# the daemon's own state (correct behaviour), which would mask this path.
+out=$(CPF_WEB_PORT=4490 CPF_STATE_DIR="$SANDBOX/no-such-state" "$BIN" status 2>&1); rc=$?
 assert_rc "status no-state rc" 0 "$rc"
 assert_contains "status no-state header" "$out" "--- tunnel profiles (up/tui) ---"
 assert_contains "status no-state names dir" "$out" "no tunnel sessions (state dir:"
 cpf stop all >/dev/null 2>&1
+
+# --- 14. daemon API + web + plist + survivability ------------------------------
+# tiny stdlib HTTP helper (mirrors the CLI client)
+api() { # method path [json] → body; rc: 0 ok / 1 HTTP error / 2 unreachable
+  python3 - "$CPF_WEB_PORT" "$1" "$2" "${3:-}" <<'PY'
+import sys, urllib.request, urllib.error
+port, method, path, body = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+req = urllib.request.Request("http://127.0.0.1:%s%s" % (port, path),
+                             data=(body.encode() if body else None), method=method,
+                             headers={"Content-Type": "application/json"})
+try:
+    sys.stdout.write(urllib.request.urlopen(req, timeout=60).read().decode())
+except urllib.error.HTTPError as e:
+    sys.stdout.write(e.read().decode()); sys.exit(1)
+except Exception:
+    sys.exit(2)
+PY
+}
+
+# health
+out=$(api GET /api/health); rc=$?
+assert_rc "api health rc" 0 "$rc"
+assert_contains "api health ok" "$out" '"ok": true'
+assert_contains "api health loopback pid" "$out" '"daemon_pid"'
+
+# up lifecycle through the API (bind daemon): rows online
+out=$(api POST /api/up "{\"profile\":\"$FIX/profiles/live.yaml\",\"include\":[\"lv\"],\"timeout\":\"20s\"}"); rc=$?
+assert_rc "api up rc" 0 "$rc"
+assert_contains "api up all online" "$out" '"all_online": true'
+
+# repoint validation: unknown pod → 400 with message (server + CLI double-check)
+out=$(api POST /api/repoint '{"local_port":64114,"pod":"ghost-pod-xyz"}'); rc=$?
+assert_rc "api repoint unknown pod rc" 1 "$rc"
+assert_contains "api repoint 400 msg" "$out" "not found"
+
+# repoint to a real fixture pod succeeds
+out=$(api POST /api/repoint '{"local_port":64114,"pod":"app-valkey-ccc3"}'); rc=$?
+assert_rc "api repoint real pod rc" 0 "$rc"
+grep -q "pod/app-valkey-ccc3" "$SB_RUN/tunnels.tsv" \
+  && PASS=$((PASS + 1)) || { FAIL=$((FAIL + 1)); FAILED_NAMES+=("api repoint row updated"); echo "FAIL: api repoint row updated"; }
+
+# down via API removes the slug's rows
+out=$(api POST /api/down '{"slug":["lv"]}'); rc=$?
+assert_rc "api down slug rc" 0 "$rc"
+grep -q "tw-lv" "$SB_RUN/tunnels.tsv" \
+  && { FAIL=$((FAIL + 1)); FAILED_NAMES+=("api down removed rows"); echo "FAIL: api down removed rows"; } \
+  || PASS=$((PASS + 1))
+
+# reload picks up a profile edit
+sed 's/default_port: 6308/default_port: 6302/' "$HOME/.config/tunnel-watcher/noizu.yaml" > "$HOME/.config/tunnel-watcher/noizu.yaml.new" \
+  && mv "$HOME/.config/tunnel-watcher/noizu.yaml.new" "$HOME/.config/tunnel-watcher/noizu.yaml"
+out=$(api POST /api/reload '{"profile":"noizu"}'); rc=$?
+assert_rc "api reload rc" 0 "$rc"
+assert_contains "api reload sees edit" "$out" "6302"
+mv "$HOME/.config/tunnel-watcher/noizu.yaml.bak" "$HOME/.config/tunnel-watcher/noizu.yaml" 2>/dev/null || \
+  cp "$ROOT/share/profiles/noizu.yaml.example" "$HOME/.config/tunnel-watcher/noizu.yaml"
+
+# setport persists to the profile yaml (same semantics as TUI `p`)
+out=$(api POST /api/setport '{"slug":"valkey","port":6306}'); rc=$?
+assert_rc "api setport rc" 0 "$rc"
+grep -q "default_port: 6306" "$HOME/.config/tunnel-watcher/noizu.yaml" \
+  && PASS=$((PASS + 1)) || { FAIL=$((FAIL + 1)); FAILED_NAMES+=("api setport persisted"); echo "FAIL: api setport persisted"; }
+out=$(api POST /api/setport '{"slug":"valkey","port":6307}'); rc=$?
+assert_rc "api setport odd rejected rc" 1 "$rc"
+cp "$ROOT/share/profiles/noizu.yaml.example" "$HOME/.config/tunnel-watcher/noizu.yaml"
+
+# plist generation: content assertions only — launchctl is NEVER invoked
+mkdir -p "$SANDBOX/plisthome"
+HOME="$SANDBOX/plisthome" CPF_NO_LAUNCHCTL=1 CPF_STATE_DIR="$SB_RUN" "$BIN" daemon install >/dev/null 2>&1
+plist="$SANDBOX/plisthome/Library/LaunchAgents/com.noizu.cluster-port-forward.plist"
+[[ -f "$plist" ]] && PASS=$((PASS + 1)) || { FAIL=$((FAIL + 1)); FAILED_NAMES+=("plist exists"); echo "FAIL: plist exists"; }
+plist_txt=$(cat "$plist" 2>/dev/null)
+assert_contains "plist label" "$plist_txt" "com.noizu.cluster-port-forward"
+assert_contains "plist KeepAlive" "$plist_txt" "KeepAlive"
+assert_contains "plist RunAtLoad" "$plist_txt" "RunAtLoad"
+assert_contains "plist daemon loop argv" "$plist_txt" "__daemon-loop"
+assert_contains "plist binary path" "$plist_txt" "$BIN"
+
+# survivability: daemon + children outlive the subshell that spawned them
+(
+  export CPF_WEB_PORT=4497 CPF_STATE_DIR="$SB_RUN-surv" FAKE_KUBE_BIND=1
+  "$BIN" daemon start >/dev/null 2>&1
+  exit 0
+)
+sleep 1
+dpid=$(cat "$SB_RUN-surv/daemon.pid" 2>/dev/null)
+if [[ -n "$dpid" ]] && kill -0 "$dpid" 2>/dev/null; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILED_NAMES+=("daemon survives subshell"); echo "FAIL: daemon survives subshell"; fi
+CPF_WEB_PORT=4497 CPF_STATE_DIR="$SB_RUN-surv" cpf up --profile "$FIX/profiles/live.yaml" --include lv --timeout 20 >/dev/null 2>&1
+assert_rc "surv daemon up rc" 0 $?
+sleep 2   # spawning CLI + subshell contexts are long gone by now
+out=$(CPF_WEB_PORT=4497 api GET /api/tunnels)
+assert_contains "surv tunnels still online" "$out" '"state": "online"'
+CPF_WEB_PORT=4497 CPF_STATE_DIR="$SB_RUN-surv" "$BIN" daemon stop >/dev/null 2>&1 || true
+
+# doctor sees the daemon + web UI
+out=$(cpf doctor 2>&1); rc=$?
+assert_rc "doctor daemon rc" 0 "$rc"
+assert_contains "doctor daemon healthy" "$out" "daemon running"
+assert_contains "doctor web api" "$out" "web API healthy on 127.0.0.1:4499"
+assert_contains "doctor web ui 200" "$out" "web UI serves 200"
 
 # --- summary -------------------------------------------------------------------
 echo
