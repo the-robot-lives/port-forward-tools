@@ -1,5 +1,6 @@
 # Threat Model — port-forward-utils
 
+<!-- 〚📁:276ac5af-7659-54ef-ad6e-0d03a053e3aa〛 THREAT-MODEL :: Security threat model — trust boundaries, STRIDE register T-001..T-009 -->
 ## Overview
 
 `cluster-port-forward` is a developer-laptop tool: it uses the operator's

@@ -1,5 +1,6 @@
 # Project Layout — port-forward-utils
 
+<!-- 〚📁:4191ab08-ebeb-5020-8e97-c5e2a7bf0550〛 PROJ-LAYOUT :: Repo layout map — bin/share/test/docs tree, install mapping, CLI surface -->
 Terminal utility: supervised `kubectl port-forward` tunnels for local tests
 against cluster data (TSDB, Valkey, Weaviate, MinIO, Infisical, app backends).
 Profile-driven tunnel management (headless `up`, `tui`, always-on `daemon` +

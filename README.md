@@ -1,5 +1,6 @@
 # port-forward-utils
 
+<!-- 〚📁:7fbba55c-4168-5965-956b-786259c7687e〛 README :: Repo entry point — what port-forward-utils is, why, install, usage, profiles, daemon, web UI -->
 **Repo:** https://github.com/the-robot-lives/port-forward-tools
 
 Keep `kubectl port-forward` tunnels up for local tests against cluster data (Timescale, Valkey, Weaviate, MinIO, Infisical, app backends).

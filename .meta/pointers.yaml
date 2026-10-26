@@ -1,0 +1,86 @@
+---
+pointers:
+  276ac5af-7659-54ef-ad6e-0d03a053e3aa:
+    created_at: 2026-10-26T22:16:01.342921Z
+    description: Security threat model — trust boundaries, STRIDE register T-001..T-009
+    file_path: docs/THREAT-MODEL.md
+    function: THREAT-MODEL
+    kind: file
+    line: 3
+    locations:
+      - file_path: docs/THREAT-MODEL.md
+        line: 3
+    token: 𓈲𓖾𓛯𓨪
+    updated_at: 2026-10-26T22:16:01.342921Z
+  4191ab08-ebeb-5020-8e97-c5e2a7bf0550:
+    created_at: 2026-10-26T22:16:01.342940Z
+    description: Repo layout map — bin/share/test/docs tree, install mapping, CLI surface
+    file_path: docs/PROJ-LAYOUT.md
+    function: PROJ-LAYOUT
+    kind: file
+    line: 3
+    locations:
+      - file_path: docs/PROJ-LAYOUT.md
+        line: 3
+    token: 𔎡𔄋𔃚𔘀
+    updated_at: 2026-10-26T22:16:01.342940Z
+  7fbba55c-4168-5965-956b-786259c7687e:
+    created_at: 2026-10-26T22:16:01.342906Z
+    description: Repo entry point — what port-forward-utils is, why, install, usage, profiles, daemon, web UI
+    file_path: README.md
+    function: README
+    kind: file
+    line: 3
+    locations:
+      - file_path: README.md
+        line: 3
+    token: 𓄘𓢟𓚦𓎾
+    updated_at: 2026-10-26T22:16:01.342906Z
+  af6a7a52-00a1-5635-9516-7e11c3afd8c8:
+    created_at: 2026-10-26T22:16:01.342943Z
+    description: Artifact schemas — catalog, tunnel profiles, state files, tunnels.tsv, web API (no DB)
+    file_path: docs/PROJ-SCHEMA.md
+    function: PROJ-SCHEMA
+    kind: file
+    line: 3
+    locations:
+      - file_path: docs/PROJ-SCHEMA.md
+        line: 3
+    token: 𔏺𔅨𓡸𓌨
+    updated_at: 2026-10-26T22:16:01.342943Z
+  c81e8d4b-b528-52b2-a5ce-73531da4d6af:
+    created_at: 2026-10-26T22:16:01.342933Z
+    description: Local hostname fabric design — Pattern A/B, IP ranges, hosts/sudoers/Caddy wiring
+    file_path: share/local-dev-hosts.md
+    function: local-dev-hosts
+    kind: file
+    line: 1
+    locations:
+      - file_path: share/local-dev-hosts.md
+        line: 1
+    token: 𓓞𓐊𓬈𔀿
+    updated_at: 2026-10-26T22:16:01.342933Z
+  ec51fbcd-2e90-5920-ae4c-510bb8bb3f4f:
+    created_at: 2026-10-26T22:16:01.342930Z
+    description: Architecture — catalog + tunnel-profile layers, daemon ownership, web/API, key decisions
+    file_path: docs/PROJ-ARCH.md
+    function: PROJ-ARCH
+    kind: file
+    line: 3
+    locations:
+      - file_path: docs/PROJ-ARCH.md
+        line: 3
+    token: 𓒆𓤥𓧸𔓟
+    updated_at: 2026-10-26T22:16:01.342930Z
+  fa154d96-6219-53cf-8563-32528d00472d:
+    created_at: 2026-10-26T22:16:01.342937Z
+    description: Daemon web dashboard UI — vanilla-JS status table, drill-down, row actions
+    file_path: share/web/index.html
+    function: web-dashboard-index
+    kind: file
+    line: 2
+    locations:
+      - file_path: share/web/index.html
+        line: 2
+    token: 𓠓𓈾𓦟𓁽
+    updated_at: 2026-10-26T22:16:01.342937Z
