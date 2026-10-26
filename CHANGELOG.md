@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## 2026-10-26
+
+- docs: correct stale "main is CI/CD-only" deploy note — merging into main triggers CI/CD (user-verified 2026-10-26)
+
 ## 2026-10-21
 
 - bin/cluster-port-forward: tunnel daemon — `daemon start|stop|restart|install|uninstall|status|logs`; one always-on supervisor owns ALL profile-tunnel children (per-key backoff 2^n cap 60s, state reloaded each tick, adopts/respawns dead rows at boot for launchd crash recovery). `daemon install` writes a launchd plist (`~/Library/LaunchAgents/com.noizu.cluster-port-forward.plist`, KeepAlive + RunAtLoad, mirroring the nx-tunnel-watchdog pattern) and loads it; manual `daemon start` fully detaches (nohup + pidfile). The daemon tears its tunnels down on stop/TERM (coherent ownership).

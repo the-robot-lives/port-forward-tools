@@ -8,7 +8,7 @@ Claude Code loads [CLAUDE.md](./CLAUDE.md). Same policy; this file is the harnes
 
 1. **Trinity Protocol (REQUIRED)**: substantive responses run Orientation → Friction → Response (assumptions surfaced; WEDGE/SHADOW/CRITIC; meta-review). Full text: trl-infra `protocols/the-trinity-protocol.md` (+ `.summary.md`).
 2. **No shell in the main thread** — delegate lookups/builds/test runs to tasker subagents; they report answers, not raw output.
-3. **PRs target `develop`.** Never merge or push `main` (CI/CD-only release path).
+3. **PRs target `develop`.** `main` is release-triggered: merging into `main` kicks off CI/CD (build → bump-chart → ArgoCD sync); promotions land via stage→main PRs.
 
 ## Identity
 
@@ -42,7 +42,7 @@ All work happens on git worktrees, created from **this repo's own `.git`** — n
 
 - Submodules sit on **`develop`** — keep your checkout on `develop`.
 - All PRs target **`develop`** (feature/bug/task branches fork from `develop`).
-- **`main` is CI/CD-only**: CI/CD automation performs all merges into `main` (release path). Never merge to or push `main` by hand.
+- **`main` is release-triggered**: a merge into `main` triggers CI/CD (image build → `bump-chart` → ArgoCD sync). Promotions land via `stage` → `main` PRs per the monorepo merge matrix.
 
 ## Pointers
 
