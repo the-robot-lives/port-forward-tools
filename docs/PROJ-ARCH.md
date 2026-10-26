@@ -3,15 +3,25 @@
 ## Overview
 
 **port-forward-utils** is a pure-Bash package with one CLI,
-`cluster-port-forward`, that keeps long-lived `kubectl port-forward` tunnels
-alive for local tests against cluster (prod-like) data: Timescale, Valkey,
-Weaviate, Qdrant, MinIO, Infisical, and app backends.
+`cluster-port-forward` (~2.3k lines), that keeps long-lived
+`kubectl port-forward` tunnels alive for local tests against cluster
+(prod-like) data: Timescale, Valkey, Weaviate, Qdrant, MinIO, Infisical, and
+app backends.
 
-There is **no in-repo library** and **no k8-lib dependency**. Targets live in a
-whitespace catalog (`share/port-forwards.catalog`); runtime state is pid/meta/log
-files under `$CPF_STATE_DIR`. Optional local-dev fabric: macOS `lo0` aliases
-(`10.0.0.x`), marked `/etc/hosts` blocks (`*.dev`), and a Caddyfile for
-Host-based `:80` routing.
+Two management layers share one state store:
+
+- **Catalog surface** (legacy): whitespace catalog (`share/port-forwards.catalog`)
+  + foreground `start`/`watch` supervisor; per-name pid/meta/log state under
+  `$CPF_STATE_DIR`. Optional local-dev fabric: macOS `lo0` aliases (`10.0.0.x`),
+  marked `/etc/hosts` blocks (`*.dev`), and a Caddyfile for Host-based `:80`
+  routing.
+- **Tunnel-profile engine** (`up` / `tui` / `daemon`): YAML profiles
+  (`~/.config/tunnel-watcher/<name>.yaml`, strict subset), multi-instance pod
+  enumeration, reverse l2k tunnels, and an always-on daemon that owns every
+  tunnel in shared state (`tunnels.tsv`) with a loopback-only web dashboard +
+  JSON API on `127.0.0.1:4321`.
+
+There is **no in-repo library** and **no k8-lib dependency**.
 
 Package location (dual path in monorepo):
 `Portfolio/Utilities/source/port-forward-utils` ↔ `utilities/k8/port-forward-utils`.
@@ -23,99 +33,109 @@ Install: `make install` → `~/.local/bin/cluster-port-forward` +
 
 ```mermaid
 graph TB
-    CLI[cluster-port-forward]
-    CAT[port-forwards.catalog<br/>name ns svc remote local profiles bind]
-    ST[(CPF_STATE_DIR<br/>pid · meta · kubectl.log · selection)]
+    CLI[cluster-port-forward<br/>CLI / thin client]
+    PROF[~/.config/tunnel-watcher/*.yaml<br/>profile: endpoints, instances, l2k]
+    CAT[port-forwards.catalog<br/>legacy start/watch/doctor]
+    DAEMON[daemon __daemon-loop<br/>per-key backoff supervisor]
+    TSV[(tunnels.tsv + daemon.pid<br/>CPF_STATE_DIR)]
+    WEB[web server.py<br/>127.0.0.1:4321 UI + JSON API]
     K8S[Kubernetes API<br/>kubectl port-forward]
-    LO[127.0.0.1:high_port]
-    AL[10.0.0.x:std_port<br/>lo0 aliases]
-    HOSTS[/etc/hosts<br/>BEGIN/END noizu-local-dev]
-    CAD[Caddy :80<br/>Caddyfile.local-dev]
+    SSH[ssh_host<br/>ssh -N -R l2k reverse]
+    LO[127.0.0.1:local_port]
     APP[Local apps / tests / psql / redis-cli]
+    CLS[Cluster pods/nodes]
 
-    CLI -->|load / resolve profiles| CAT
-    CLI -->|start / ensure / stop| ST
-    CLI -->|kubectl --address| K8S
+    CLI -->|up/stop/status| DAEMON
+    CLI -->|legacy start/watch| CAT
+    DAEMON -->|parse + plan| PROF
+    DAEMON <-->|read/write rows| TSV
+    DAEMON -->|spawn| WEB
+    WEB -->|__api-* execs| CLI
+    DAEMON -->|k2l| K8S
+    DAEMON -->|l2k| SSH
     K8S --> LO
-    K8S -.->|CPF_BIND=1 + alias up| AL
-    CLI -->|aliases up/down| AL
-    CLI -->|hosts install/uninstall| HOSTS
-    CAD -->|reverse_proxy| LO
+    SSH -.->|*:remote_port| CLS
     APP --> LO
-    APP -.->|Pattern B hostnames| AL
-    APP -.->|Pattern A HTTP| CAD
+    APP -.->|browser| WEB
 ```
 
 ## Core Components
 
 | Component | Role |
 |-----------|------|
-| `bin/cluster-port-forward` (~579 loc) | Sole executable: catalog load, selection, PF lifecycle, supervisor loop, hosts/aliases helpers |
-| `share/port-forwards.catalog` | Declarative targets (profiles + optional `bind_ip`/`bind_port`) |
-| `share/hosts.local-dev` | Host→`10.0.0.x` block for `hosts install` |
-| `share/Caddyfile.local-dev` | Pattern A: Host header → `127.0.0.1:local_port` |
-| `share/local-dev-hosts.md` | Design notes (Pattern A/B, IP ranges, hybrid) |
-| `share/sudoers.d-noizu-local-dev` | macOS NOPASSWD digests for `ifconfig lo0` + `tee /etc/hosts` |
-| `Makefile` | `install` (copy bin + share), `test` (`bash -n`), `doctor` |
+| `bin/cluster-port-forward` (~2.3k loc) | Sole executable: catalog load/selection, PF lifecycle, watch supervisor, tunnel-profile engine (parse/plan/instances/l2k), TUI, daemon supervisor loop, hosts/aliases helpers, hidden `__api-*` mutation commands |
+| `share/port-forwards.catalog` | Declarative legacy targets (profiles + optional `bind_ip`/`bind_port`) |
+| `share/profiles/noizu.yaml.example` | Starter tunnel profile (k2l endpoints, multi-instance, commented l2k) |
+| `share/web/server.py` | Daemon-spawned API/UI server — python3 stdlib, binds `127.0.0.1` only, mutations exec the CLI (regex-validated, re-parsed by the profile/spec parser) |
+| `share/web/index.html` | Vanilla-JS dashboard: status table, refresh, restart/stop/repoint/set-port |
+| `share/hosts.local-dev` + `Caddyfile.local-dev` + `sudoers.d-noizu-local-dev` | Pattern A/B local-dev edge |
+| `test/run-tests.sh` + `test/fixtures/` | 157-assertion suite on fake kubectl/ssh (sandboxed HOME) |
+| `Makefile` | `install` (bin + share + profile seed + web), `test` (`bash -n` + suite), `doctor` |
+
+→ *Components ↔ directories: see [PROJ-LAYOUT.md](PROJ-LAYOUT.md)*
 
 ## CLI surface
 
 | Command | Behavior |
 |---------|----------|
-| `start [profile\|name …]` | One-shot PF for selection (default profile: `data`); writes `selection.txt` |
-| `watch` / `supervise` / `daemon` | Start + poll `ensure_one` every `CPF_POLL_SEC` (default 3); Ctrl-C / EXIT stops selection |
-| `stop [name\|all]` | Kill selected (or last selection / all catalog names) |
-| `status` / `st` | Per-name PID, loopback open?, bind open?, state (`up` / `port-up` / `down` / `off`) |
+| `start [profile\|name …]` | One-shot catalog PF (default `data`); writes `selection.txt` |
+| `watch` / `supervise` | Foreground poll loop (`CPF_POLL_SEC`); Ctrl-C stops selection |
+| `stop [name\|all]` | Kill selected / last selection / catalog names (incl. profile rows) |
+| `status` / `st` | Legacy state + profile-tunnel appendix; `--profile P` filters |
 | `list` / `ls` | Dump catalog columns including bind |
-| `doctor` / `check` | Cluster reachability + each catalog `ns/svc` existence |
+| `doctor` / `check` | Cluster reachability, catalog `ns/svc` existence, ssh/GatewayPorts, daemon + web health, port-gap warnings |
 | `hosts print\|blurb\|install\|uninstall` | Manage marked Noizu block in `/etc/hosts` |
-| `aliases up\|down\|status` | macOS `lo0` aliases for distinct catalog `bind_ip`s (+ always `10.0.0.1`) |
+| `aliases up\|down\|status` | macOS `lo0` aliases for catalog `bind_ip`s (+ `10.0.0.1`) |
+| `up [spec …] [--profile P]` | Plan + start profile tunnels via daemon; `--timeout`, `--json`, `--dry-run`, `--watch`, `--tui`; exit 0 iff all online |
+| `tui` | ANSI table, drill ns→svc→pods, `p` persist port into profile, `s/r/a/K/q` |
+| `daemon start\|stop\|restart\|status\|logs\|install\|uninstall` | Always-on supervisor; `install` = launchd plist (KeepAlive + RunAtLoad) |
+| `profile-parse` | Debug dump of normalized profile endpoints |
 
-Profiles resolved from catalog membership: `data`, `platform`, `infra`, `ai`,
-`apps`, `minio`, `all` (or individual service names). Selection is de-duplicated.
+Include-spec grammar: `slug`, `slug-oldest/-latest/-num-N/-default`, `slug[:PORT]`,
+`name/namespace[:PORT]` (raw catalog bypass); comma-separated, repeatable.
 
-## Catalog model
+## Profile engine
 
-Whitespace-separated lines (comments/`#` skipped):
-
-```text
-name  namespace  service  remote_port  local_port  profiles  [bind_ip]  [bind_port]
-```
-
-| Field | Meaning |
-|-------|---------|
-| `local_port` | Always forwarded on **`127.0.0.1`** (Caddy / tools / high ports) |
-| `profiles` | Comma list for group start (`data,apps,all`) |
-| `bind_ip` / `bind_port` | Optional second PF with `--address bind_ip` (Pattern B std ports) |
-
-Resolution order for catalog (and hosts file): `$CPF_CATALOG` / `$CPF_HOSTS_FILE`
-if set and exists → script-relative `../share/` →
-`${XDG_DATA_HOME:-~/.local/share}/noizu-port-forwards/` →
-`~/.local/share/noizu-port-forwards/`.
-
-Default catalog maps three TSDB/Valkey tiers (apps/platform/infra), MinIO +
-console + Infisical, Weaviate/gRPC + Qdrant/gRPC, and portfolio backends
-(therobotplans API/UI, npl-mcp/UI, therobotdrafts).
+Profiles are a **strict YAML subset** (top-level scalars + one `endpoints:` list;
+unknown syntax fails loudly with a line number). Endpoint fields: `slug`,
+`namespace`, `service`, `kind` (`service|pod|deployment`), `default_port` (even),
+`instances: true` (per-pod local port = `default_port + 2n + 4`, oldest first),
+`default_instance` (`latest|oldest|num-N|first`), `direction: l2k` (reverse:
+`ssh -N -R *:remote_port` on `ssh_host`, autossh when available; health = `nc`
+probe of the node IP), `local_port`/`remote_port` for l2k. Plan-time overlap
+dropping: defaults win, colliding instance rows dropped with a warning.
 
 ## Runtime flow
 
-### Start / ensure (per service)
+### Daemon (owns every profile tunnel)
 
-1. `load_catalog` → parallel bash arrays (`NAME`, `NS`, `SVC`, …)
-2. `resolve_selection` tokens → unique service names
-3. **Loopback PF**: `kubectl port-forward -n NS SVC --address 127.0.0.1 LP:RP`
-4. If `CPF_BIND=1` (default) and catalog has bind fields and `ip_usable(bind_ip)`:
-   second PF `--address bind_ip BP:RP` (pid file `*.bind.pid`)
-5. If local port already open and not owned by tracked pid → mark pid
-   **`external`** (do not reclaim / kill)
-6. Wait up to ~9s (`30 × 0.3s`) for port open via `nc` or bash `/dev/tcp`
-7. Write `name.meta` (ns/svc/ports/bind) + kubectl logs under state dir
+1. `daemon start` detaches (nohup + `daemon.pid`); `daemon install` writes and
+   loads the launchd plist (`com.noizu.cluster-port-forward`, KeepAlive).
+2. Daemon loop: load profile, `tw_state_persist` merges rows into
+   `tunnels.tsv` (T_* rows win, foreign keys preserved), starts planned
+   tunnels, then each tick reloads shared state, restarts dead rows with
+   **per-key exponential backoff** (cap 60s), and adopts/respawns dead rows at
+   boot (launchd crash recovery). `daemon stop`/TERM tears tunnels down.
+3. `up`/`stop`/`status` are daemon clients: same table/`--json` contract,
+   rendered from shared state; daemon unreachable ⇒ loud refusal. `--dry-run`
+   never touches the daemon; `watch`/`tui`/legacy commands stay in-band.
 
-### Watch supervisor
+### Legacy start / ensure (per service)
 
-Foreground loop: for each selected name, `ensure_one` restarts dead or
-non-listening PFs; sleep `CPF_POLL_SEC`. Trap INT/TERM/EXIT runs `stop_one` for
-the selection only.
+1. `load_catalog` → parallel bash arrays; `resolve_selection` → unique names
+2. Loopback PF: `kubectl port-forward -n NS SVC --address 127.0.0.1 LP:RP`
+3. Optional second PF `--address bind_ip BP:RP` when `CPF_BIND=1` + alias up
+4. Open-but-unowned port → pid marked **`external`** (never reclaimed)
+5. Wait ≤~9s for port open (`nc` / `/dev/tcp`); write meta + kubectl logs
+
+### Web/API (loopback only)
+
+`server.py` (spawned by the daemon) serves the dashboard and JSON API on
+`127.0.0.1:$CPF_WEB_PORT` (default 4321): `GET /api/health`, `GET /api/tunnels`,
+`POST /api/up|down|restart|repoint|setport|reload`. Every input is
+regex-validated server-side **and** re-validated by routing mutations through
+the CLI's profile/spec parser (hidden `__api-*` commands run with
+`CPF_API_INTERNAL=1` so they use the local supervisor, not the HTTP API).
 
 ### State directory
 
@@ -124,31 +144,22 @@ Default: `${XDG_RUNTIME_DIR:-/tmp}/noizu-port-forwards` (`CPF_STATE_DIR`).
 | Artifact | Purpose |
 |----------|---------|
 | `<name>.pid` / `<name>.bind.pid` | kubectl PF PIDs (or `external`) |
-| `<name>.meta` | Last start metadata |
-| `<name>.kubectl.log` / `<name>-bind.kubectl.log` | PF process stdout/err |
-| `selection.txt` | Last start/watch selection (used by bare `stop`) |
-| `supervisor.log` | Timestamped start/reconnect lines (`CPF_LOG` override) |
+| `<name>.meta`, `selection.txt`, `<name>*.kubectl.log` | legacy per-name state |
+| `tunnels.tsv` | 13-column pipe-delimited shared tunnel rows (daemon + web + TUI) |
+| `daemon.pid`, `daemon.log` | daemon lifecycle |
+| `supervisor.log` | legacy watch log (`CPF_LOG`) |
 
 ## Local-dev fabric (optional)
-
-Two complementary patterns (documented in `share/local-dev-hosts.md`):
 
 | Pattern | Mechanism | Best for |
 |---------|-----------|----------|
 | **A** | All names → `127.0.0.1`; Caddy/nginx on `:80` Host-routes to high `local_port` | HTTP demos without remembering ports |
 | **B** | `lo0` aliases `10.0.0.x` + hosts map; PF binds std ports (5432/6379/80) on alias IPs | DB/TCP clients wanting default ports |
 
-**Hybrid (recommended):** A for HTTP UIs; B for data plane.
-
-Reserved local-only ranges (loopback aliases, not LAN): `.1` edge; `.10–19`
-data; `.20–29` infra; `.40–49` AI; `.60–89` apps. Hosts dual-label
-`*.dev` and `*.dev.noizu.local`.
-
-`aliases` uses `sudo /sbin/ifconfig lo0 alias| -alias` (macOS-centric).
-`hosts install` rewrites `/etc/hosts` via `sudo /usr/bin/tee` with
-`# BEGIN/END noizu-local-dev` markers. Optional sudoers template pins binary
-sha256 digests for passwordless use (user hard-coded in template — edit before
-install).
+**Hybrid (recommended):** A for HTTP UIs; B for data plane. Reserved ranges
+(loopback aliases, not LAN): `.1` edge; `.10–19` data; `.20–29` infra;
+`.40–49` AI; `.60–89` apps. Hosts dual-label `*.dev` and `*.dev.noizu.local`.
+`aliases`/`hosts` use sudo (digest-pinned sudoers template available on macOS).
 
 ## Configuration / environment
 
@@ -162,56 +173,41 @@ install).
 | `CPF_BIND` | `1` | enable secondary bind_ip PFs |
 | `CPF_POLL_SEC` | `3` | watch poll interval |
 | `CPF_LOG` | `$STATE_DIR/supervisor.log` | supervisor log path |
-
-No `infra-config.yaml` / k8-lib: topology is the catalog file only.
+| `TUNNEL_WATCHER_PROFILE` | (unset) | default tunnel profile name |
+| `TUNNEL_WATCHER_DIR` | `~/.config/tunnel-watcher` | profile config dir |
+| `CPF_WEB_PORT` | `4321` | daemon web/API port |
 
 ## Key Decisions
 
 | Decision | Rationale |
 |----------|-----------|
-| Single self-contained bash script | Zero install deps beyond kubectl + shell; no shared lib version skew |
-| Catalog file, not infra-config | PF targets are operator-local (ports/aliases) more than deploy topology |
+| Single self-contained bash script (+ stdlib python web) | Zero install deps beyond kubectl + shell + python3; no shared-lib version skew |
+| Catalog file, not infra-config | PF targets are operator-local (ports/aliases), not deploy topology |
+| Tunnel profiles are a strict YAML subset | Loud line-numbered parse errors beat silent YAML surprises |
+| Daemon owns tunnels (not the shell) | Closing the terminal / agent subshell must not kill forwards; launchd KeepAlive restores after reboot/crash |
+| Loopback-only web API, mutations via CLI re-parse | No new injection surface; the dashboard can never bypass the same validation the CLI applies |
+| Never steal open ports (`external`) | Avoid killing foreign processes; operator frees or changes the port |
 | Dual bind (loopback + optional alias) | Caddy/tools keep high ports; apps can use host=`*.dev` port=5432 |
-| Never steal open ports (`external`) | Avoid killing foreign processes; operator frees or changes catalog local port |
-| Supervisor is foreground watch only | Simple Ctrl-C lifecycle; no systemd/launchd daemon in-package |
+| l2k reverse tunnels opt-in, ≥20-port gaps | Explicit direction + spacing guidance; doctor checks GatewayPorts |
 | Credentials out of scope | Tool only tunnels; secrets from Infisical / k8s / `dc` as usual |
-| Not a liquibase-shell replacement | Migrations keep short-lived PF + secret fetch; this is long-lived multi-service |
-| macOS-first aliases/sudoers | Primary laptop OS for Noizu local-dev; Linux aliases need different tooling |
+| macOS-first aliases/sudoers | Primary laptop OS for Noizu local-dev |
 
 ## Tech Stack
 
 | Layer | Choice |
 |-------|--------|
-| Language | Bash (`set -euo pipefail`) |
-| Cluster | `kubectl port-forward` |
+| Language | Bash (`set -euo pipefail`); web server python3 stdlib (`http.server`) |
+| Cluster | `kubectl port-forward` (k2l); `ssh -N -R` (+autossh) for l2k |
 | Port probe | `nc -z` (fallback `/dev/tcp`) |
+| Persistence | launchd plist (KeepAlive + RunAtLoad) for always-on mode |
 | Alias / hosts | `ifconfig lo0`, `tee /etc/hosts` (sudo) |
 | Optional HTTP edge | Caddy + `share/Caddyfile.local-dev` |
-| Install | `make` + `install -m 755/644` |
-| Tests | `bash -n` only |
-
-## External runtime prerequisites
-
-| Tool / condition | Required for |
-|------------------|--------------|
-| `kubectl` + reachable cluster | All PF / doctor |
-| `nc` or bash `/dev/tcp` | Liveness / ready checks |
-| macOS `ifconfig lo0` + sudo | `aliases up` (Pattern B) |
-| sudo write `/etc/hosts` | `hosts install` |
-| Caddy (optional) | Pattern A HTTP demos |
-| Catalog Services present in cluster | Successful tunnels (doctor surfaces gaps) |
-
-## Ecosystem fit
-
-Sibling of `cluster-utils`, `database-utils`, `docker-utils`, `secret-utils` under
-monorepo utilities. Complements short-lived PFs in `liquibase-shell` /
-`provision-db` by providing **persistent multi-service** tunnels for app tests
-and demos. Does not integrate Infisical or Helm; sits beside them in the local
-dev loop.
+| Tests | `bash -n` + `test/run-tests.sh` (157 assertions, fake kubectl/ssh) |
 
 ## Related docs
 
 - Layout tree: [PROJ-LAYOUT.md](PROJ-LAYOUT.md)
-- Config/state artifact schema: [PROJ-SCHEMA.md](PROJ-SCHEMA.md)
+- Config/state/API artifact schema: [PROJ-SCHEMA.md](PROJ-SCHEMA.md)
+- Threat model: [THREAT-MODEL.md](THREAT-MODEL.md)
 - Operator usage: [../README.md](../README.md)
 - Local hostname design: [../share/local-dev-hosts.md](../share/local-dev-hosts.md)
