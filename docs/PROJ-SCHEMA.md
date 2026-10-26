@@ -1,5 +1,6 @@
 # Data & Config Schema — port-forward-utils
 
+<!-- 〚📁:af6a7a52-00a1-5635-9516-7e11c3afd8c8〛 PROJ-SCHEMA :: Artifact schemas — catalog, tunnel profiles, state files, tunnels.tsv, web API (no DB) -->
 > **No persistence layer.** This project has **no database, no SQL schema, and no
 > Liquibase changelogs** — ERDs over tables do not apply. `cluster-port-forward`
 > is a stateless-per-install bash CLI: durable "data" is flat config under

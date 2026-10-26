@@ -1,3 +1,5 @@
+<!-- 〚📁:c81e8d4b-b528-52b2-a5ce-73531da4d6af〛 local-dev-hosts :: Local hostname fabric design — Pattern A/B, IP ranges, hosts/sudoers/Caddy wiring -->
+
 # Local-dev hostnames + static internal IPs (no port in URLs)
 
 Goal: run demos and local tests against **cluster-forwarded** services as clean names on **port 80** (HTTP) or **default protocol ports** (Postgres/Redis), e.g.:

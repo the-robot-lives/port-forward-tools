@@ -1,5 +1,6 @@
 # port-forward-utils — Architecture
 
+<!-- 〚📁:ec51fbcd-2e90-5920-ae4c-510bb8bb3f4f〛 PROJ-ARCH :: Architecture — catalog + tunnel-profile layers, daemon ownership, web/API, key decisions -->
 ## Overview
 
 **port-forward-utils** is a pure-Bash package with one CLI,
