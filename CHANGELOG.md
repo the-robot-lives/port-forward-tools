@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## 2026-10-28
+
+- docs: add AGENT-README.md (agent orientation)
+
 ## 2026-10-26
 
 - docs: doc-sweep 2026-10-26 — PROJ-ARCH/LAYOUT/SCHEMA (+summaries) updated for the tunnel-profile engine, daemon + web UI/API, l2k reverse tunnels, and the test suite (corrected stale claims: ~579-loc script → ~2.3k, "foreground watch only / no launchd daemon" → daemon + KeepAlive, bash-n-only tests → 157-assertion suite); THREAT-MODEL.md(+.summary) created — STRIDE register T-001..T-009, web API Origin/Host validation flagged Open (T-001). Pointer-sync PR (`.meta/pointers.yaml` + markers) follows from this develop.
