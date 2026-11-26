@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# test/fixtures/watchdog/curl — prints 200 (ready) while
+# $WD_FIXTURE_DIR/tunnel-live exists, 000 + rc 7 otherwise.
+CTL="${WD_FIXTURE_DIR:?WD_FIXTURE_DIR not set}"
+if [ -f "$CTL/tunnel-live" ]; then
+  printf '200'
+  exit 0
+fi
+printf '000'
+exit 7

@@ -41,6 +41,25 @@ Profiles: `data` (app/platform/infra TSDB + Valkey), `ai` (weaviate, weaviate-gr
 
 Docs: `docs/` (PROJ-ARCH, PROJ-LAYOUT, PROJ-SCHEMA).
 
+## SSH Tunnel Watchdogs (db / valkey / weaviate)
+
+When the cluster API (`:6443`) is unreachable from this Mac, `kubectl port-forward` cannot run — but `noizu.server` is reachable by ssh and reaches the services. The watchdogs keep one `ssh -N -L` tunnel each alive and restart it on disconnect.
+
+```bash
+db-watchdog up            # background supervisor (same verbs: start/watch, stop, restart, status, logs)
+valkey-watchdog status    # valkey up local_port=56379 address=10.0.0.95:6379 supervisor=4242 probe=NOAUTH…
+weaviate-watchdog logs    # last 40 log lines
+make uninstall            # removes the four watchdogs from ~/.local/bin
+```
+
+- **One implementation, three entries**: `bin/tunnel-watchdog <db|valkey|weaviate> <command>`; the thin entries resolve their own directory, so installed copies and symlinks both work. `make install` puts all four in `~/.local/bin`.
+- **Table**: db = `apps/app-timescaledb` 5432→54330, valkey = `apps/app-valkey` 6379→56379, weaviate = `platform-ai/weaviate` 80→18081 — the same local ports the catalog uses, so existing consumers keep working.
+- **Address resolved at every start**: the clusterIP is fetched on the host (`ssh noizu.server kubectl --context noizu -n <ns> get svc <svc> …` — read-only `get` only) right before each tunnel start; never hardcoded, so drifted addresses need no edits here.
+- **Restart behaviour**: a dead ssh is restarted within ~1s; the back-off doubles 1→60s while starts keep failing and resets after a tunnel has held for a minute; 3 failed probes in a row stop and re-resolve the tunnel; checks every 20s.
+- **Does not fight other forwards**: if the local port already answers as the expected service (`cluster-port-forward` or anything else), the watchdog waits and starts its own tunnel only once the port stops answering; it never kills a process it did not start (stop only ever signals pids from its own pidfiles).
+- **Probes**: `pg_isready` (fallback: bash `/dev/tcp`), `redis-cli PING` (any answer — `PONG` or `NOAUTH` — proves the service replied), `curl …/v1/.well-known/ready` = 200.
+- **Safety**: no sudo, no secrets read or printed; state (pidfiles + log, mode 700) lives under `~/.local/state/tunnel-watchdog/`. Env overrides: `TUNNEL_SSH_HOST`, `TUNNEL_KUBE_CONTEXT`, `TUNNEL_{DB,VALKEY,WEAVIATE}_{LOCAL,REMOTE}_PORT`. To run them at login, add one launchd `KeepAlive` plist per `<svc>-watchdog watch` (same pattern as `cluster-port-forward daemon install`).
+
 ## Tunnel Profiles (up / tui)
 
 Profile-driven headless + interactive tunnel management on top of the catalog surface.

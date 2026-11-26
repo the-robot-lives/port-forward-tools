@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# test/fixtures/watchdog/redis-cli — answers NOAUTH (proof the service spoke,
+# no credentials needed) while $WD_FIXTURE_DIR/tunnel-live exists.
+CTL="${WD_FIXTURE_DIR:?WD_FIXTURE_DIR not set}"
+if [ -f "$CTL/tunnel-live" ]; then
+  echo "NOAUTH Authentication required."
+  exit 0
+fi
+echo "Could not connect to Redis at 127.0.0.1:56379: Connection refused"
+exit 1

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# weaviate-watchdog — thin entry: `tunnel-watchdog weaviate <command>` from this directory.
+# Resolves its own path so it works through a copy or symlink in ~/.local/bin.
+set -u
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self") || break
+  case $link in
+    /*) self=$link ;;
+    *) self=$(dirname "$self")/$link ;;
+  esac
+done
+dir=$(cd "$(dirname "$self")" && pwd -P) || exit 1
+exec "$dir/tunnel-watchdog" weaviate "$@"
