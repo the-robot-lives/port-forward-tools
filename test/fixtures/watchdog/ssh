@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# test/fixtures/watchdog/ssh — fake ssh for the tunnel-watchdog tests.
+# Two modes:
+#   resolve: the remote command contains "get svc" -> records the invocation
+#            and prints $WD_FIXTURE_DIR/cluster-ip (default 10.0.0.144).
+#   tunnel:  a -L argument is present -> records the invocation, parks (1s
+#            loop), honors $WD_FIXTURE_DIR/ssh-exit (rm + exit 0) and
+#            ssh-fail (exit 1), and maintains tunnel-live while alive.
+CTL="${WD_FIXTURE_DIR:?WD_FIXTURE_DIR not set}"
+LOGF="$CTL/ssh-invocations"
+
+case "$*" in
+  *"get svc"*)
+    printf '%s\n' "$*" >> "$LOGF"
+    if [ -f "$CTL/cluster-ip" ]; then cat "$CTL/cluster-ip"; else echo "10.0.0.144"; fi
+    exit 0 ;;
+esac
+
+is_tunnel=0
+for a in "$@"; do
+  [ "$a" = "-L" ] && is_tunnel=1
+done
+if [ "$is_tunnel" -eq 1 ]; then
+  printf '%s\n' "$*" >> "$LOGF"
+  cleanup_live() { rm -f "$CTL/tunnel-live"; }
+  trap cleanup_live EXIT
+  echo $$ > "$CTL/tunnel-live"
+  i=0
+  while [ "$i" -lt 600 ]; do
+    if [ -f "$CTL/ssh-exit" ]; then rm -f "$CTL/ssh-exit"; exit 0; fi
+    if [ -f "$CTL/ssh-fail" ]; then exit 1; fi
+    sleep 1
+    i=$(( i + 1 ))
+  done
+  exit 0
+fi
+exit 0

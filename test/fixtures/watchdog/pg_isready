@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# test/fixtures/watchdog/pg_isready — answers only while $WD_FIXTURE_DIR/tunnel-live
+# exists (i.e. a tunnel — ours or another forward — holds the local port).
+CTL="${WD_FIXTURE_DIR:?WD_FIXTURE_DIR not set}"
+if [ -f "$CTL/tunnel-live" ]; then
+  echo "127.0.0.1:54330 - accepting connections"
+  exit 0
+fi
+echo "127.0.0.1:54330 - no response" >&2
+exit 2

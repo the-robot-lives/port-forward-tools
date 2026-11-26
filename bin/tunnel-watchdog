@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+# tunnel-watchdog — keep one SSH tunnel to a cluster service alive.
+#
+# One implementation, three services (db / valkey / weaviate); db-watchdog,
+# valkey-watchdog and weaviate-watchdog are thin entries that pass the service
+# by name, so they work through copies or symlinks in ~/.local/bin.
+#
+# Why: from a Mac where the cluster API (:6443) is unreachable, kubectl
+# port-forward cannot run — but `noizu.server` is reachable by ssh and reaches
+# the services. The tunnel carries `<clusterIP>:<remote port>` (resolved on the
+# host with the host's own kubectl, read-only `get`, at EVERY start — the
+# addresses drift) to a fixed loopback port.
+#
+# It does not fight another forward: if the local port already answers as the
+# expected service (cluster-port-forward or anything else), the watchdog waits
+# and starts its own tunnel only once the port stops answering. It never kills
+# a process it did not start (stop only ever signals pids from its own
+# pidfiles).
+#
+# Usage: tunnel-watchdog <db|valkey|weaviate> <up|start|watch|stop|restart|status|logs>
+#
+#   up            start the supervisor in the background (refuses when running)
+#   start|watch   run the supervisor in the foreground
+#   stop          stop the tunnel this watchdog started, and its supervisor
+#   restart       stop, then up
+#   status        one status line; exit 0 when the service answers locally
+#   logs          last 40 log lines
+#
+# Env overrides:
+#   TUNNEL_SSH_HOST          (default noizu.server)
+#   TUNNEL_KUBE_CONTEXT      (default noizu; only ever used for read-only `get`)
+#   TUNNEL_DB_LOCAL_PORT / TUNNEL_DB_REMOTE_PORT          (54330 / 5432)
+#   TUNNEL_VALKEY_LOCAL_PORT / TUNNEL_VALKEY_REMOTE_PORT  (56379 / 6379)
+#   TUNNEL_WEAVIATE_LOCAL_PORT / TUNNEL_WEAVIATE_REMOTE_PORT (18081 / 80)
+#   TUNNEL_CHECK_INTERVAL (20s), TUNNEL_FAIL_THRESHOLD (3), TUNNEL_BACKOFF_MAX
+#   (60s), TUNNEL_HELD_RESET (60s) — test hooks; defaults are the shipped
+#   behaviour (20s checks, 3 probe fails restart the tunnel, back-off doubles
+#   to 60s, reset after a tunnel held for a minute).
+#
+# State: ${XDG_STATE_HOME:-$HOME/.local/state}/tunnel-watchdog/<service>/ (mode 700)
+#
+# No sudo, no launchd, no secrets: the ssh key comes from your own agent,
+# nothing is read or printed beyond tunnel bookkeeping.
+
+set -u
+umask 077
+
+PROG="tunnel-watchdog"
+
+resolve_self_dir() {
+  local target link dir
+  target=$0
+  while [ -L "$target" ]; do
+    link=$(readlink "$target") || break
+    case $link in
+      /*) target=$link ;;
+      *) target=$(dirname "$target")/$link ;;
+    esac
+  done
+  dir=$(cd "$(dirname "$target")" && pwd -P) || return 1
+  printf '%s\n' "$dir"
+}
+
+SELF_DIR=$(resolve_self_dir) || { echo "$PROG: cannot resolve my own path" >&2; exit 1; }
+
+# --- service table (the only place per-service facts live) --------------------
+
+SVC_KEY="${1:-}"
+case $SVC_KEY in
+  db)       NS="apps";        SVC="app-timescaledb"; PROBE_KIND="postgres" ;;
+  valkey)   NS="apps";        SVC="app-valkey";      PROBE_KIND="valkey"   ;;
+  weaviate) NS="platform-ai"; SVC="weaviate";        PROBE_KIND="http"     ;;
+  *)
+    echo "Usage: $PROG <db|valkey|weaviate> <up|start|watch|stop|restart|status|logs>" >&2
+    exit 2 ;;
+esac
+
+CMD="${2:-}"
+case $CMD in
+  up|start|watch|stop|restart|status|logs) ;;
+  *)
+    echo "Usage: $PROG <db|valkey|weaviate> <up|start|watch|stop|restart|status|logs>" >&2
+    exit 2 ;;
+esac
+
+# --- configuration ------------------------------------------------------------
+
+SSH_HOST="${TUNNEL_SSH_HOST:-noizu.server}"
+KUBE_CONTEXT="${TUNNEL_KUBE_CONTEXT:-noizu}"
+CHECK_INTERVAL="${TUNNEL_CHECK_INTERVAL:-20}"      # seconds between probes
+FAIL_THRESHOLD="${TUNNEL_FAIL_THRESHOLD:-3}"       # probe fails before restart
+BACKOFF_BASE="${TUNNEL_BACKOFF_BASE:-1}"           # first back-off step (seconds)
+BACKOFF_MAX="${TUNNEL_BACKOFF_MAX:-60}"            # back-off cap (seconds)
+HELD_RESET="${TUNNEL_HELD_RESET:-60}"              # tunnel held this long -> back-off resets
+
+case $SVC_KEY in
+  db)       LPORT="${TUNNEL_DB_LOCAL_PORT:-54330}";       RPORT="${TUNNEL_DB_REMOTE_PORT:-5432}" ;;
+  valkey)   LPORT="${TUNNEL_VALKEY_LOCAL_PORT:-56379}";   RPORT="${TUNNEL_VALKEY_REMOTE_PORT:-6379}" ;;
+  weaviate) LPORT="${TUNNEL_WEAVIATE_LOCAL_PORT:-18081}"; RPORT="${TUNNEL_WEAVIATE_REMOTE_PORT:-80}" ;;
+esac
+
+for portvar in "$LPORT" "$RPORT"; do
+  case $portvar in ''|*[!0-9]*)
+    echo "$PROG: bad port '$portvar' for $SVC_KEY" >&2
+    exit 2 ;;
+  esac
+done
+
+STATE_BASE="${XDG_STATE_HOME:-$HOME/.local/state}/tunnel-watchdog"
+STATE_DIR="$STATE_BASE/$SVC_KEY"
+LOG="$STATE_DIR/watchdog.log"
+SUP_PIDFILE="$STATE_DIR/supervisor.pid"
+TUN_PIDFILE="$STATE_DIR/tunnel.pid"
+ADDR_FILE="$STATE_DIR/address"
+
+TUNNEL_PID=""
+TUNNEL_STARTED=0
+PROBE_ANSWER="n/a"
+
+ensure_state_dir() {
+  [ -d "$STATE_BASE" ] || { mkdir -p "$STATE_BASE" && chmod 700 "$STATE_BASE"; }
+  [ -d "$STATE_DIR" ] || { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; }
+  return 0
+}
+
+log() {
+  ensure_state_dir
+  printf '%s %s: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$SVC_KEY" "$*" >> "$LOG"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+read_pid() { # $1 = pidfile -> prints pid, rc 0 when it parses
+  local pid
+  [ -f "$1" ] || return 1
+  pid=$(cat "$1" 2>/dev/null)
+  case $pid in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$pid"
+}
+
+sup_alive() {
+  local p
+  p=$(read_pid "$SUP_PIDFILE" 2>/dev/null) && kill -0 "$p" 2>/dev/null
+}
+
+tunnel_alive() {
+  local p
+  p=$(read_pid "$TUN_PIDFILE" 2>/dev/null) && kill -0 "$p" 2>/dev/null
+}
+
+# --- probe: does 127.0.0.1:$LPORT answer as the expected service? -------------
+
+tcp_probe() { # bash /dev/tcp fallback when the native client is not installed
+  if (exec 3<>"/dev/tcp/127.0.0.1/$LPORT") 2>/dev/null; then
+    PROBE_ANSWER="tcp"
+    return 0
+  fi
+  PROBE_ANSWER="no-answer"
+  return 1
+}
+
+probe() {
+  local out
+  case $PROBE_KIND in
+    postgres)
+      if have pg_isready; then
+        out=$(pg_isready -h 127.0.0.1 -p "$LPORT" 2>/dev/null)
+        if [ "$?" -eq 0 ]; then PROBE_ANSWER="${out##* - }"; return 0; fi
+        PROBE_ANSWER="no-answer"; return 1
+      fi
+      tcp_probe ;;
+    valkey)
+      if have redis-cli; then
+        out=$(redis-cli -h 127.0.0.1 -p "$LPORT" PING 2>/dev/null | head -n 1)
+        # any answer proves the service is behind the port: PONG, or NOAUTH
+        # (auth required), or an error reply. Only a connect failure fails.
+        if [ -n "$out" ] && [ "${out#*Could not connect}" = "$out" ]; then
+          PROBE_ANSWER="$out"
+          return 0
+        fi
+        PROBE_ANSWER="no-answer"; return 1
+      fi
+      tcp_probe ;;
+    http)
+      out=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        "http://127.0.0.1:$LPORT/v1/.well-known/ready" 2>/dev/null)
+      if [ "$out" = "200" ]; then PROBE_ANSWER="200"; return 0; fi
+      PROBE_ANSWER="${out:-no-answer}"; return 1 ;;
+  esac
+}
+
+# --- cluster address: resolved on the host at every start (addresses drift) ---
+
+resolve_addr() {
+  local out
+  out=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$SSH_HOST" \
+    "kubectl --context $KUBE_CONTEXT -n $NS get svc $SVC -o jsonpath='{.spec.clusterIP}'" 2>/dev/null)
+  # defensive: only an IPv4-shaped answer is trusted into the -L argument
+  if printf '%s' "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  return 1
+}
+
+start_tunnel() { # $1 = cluster IP (call only from the supervisor)
+  ssh -N \
+    -o BatchMode=yes \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=3 \
+    -L "127.0.0.1:$LPORT:$1:$RPORT" \
+    "$SSH_HOST" &
+  TUNNEL_PID=$!
+  TUNNEL_STARTED=$(date +%s)
+  printf '%s\n' "$1" > "$ADDR_FILE"
+  printf '%s\n' "$TUNNEL_PID" > "$TUN_PIDFILE"
+}
+
+# --- supervisor ---------------------------------------------------------------
+
+sup_term() {
+  log "supervisor stopping on signal"
+  if [ -n "${TUNNEL_PID:-}" ]; then kill "$TUNNEL_PID" 2>/dev/null; fi
+  rm -f "$SUP_PIDFILE" "$TUN_PIDFILE"
+  exit 0
+}
+
+bump_backoff() {
+  BACKOFF=$(( BACKOFF * 2 ))
+  [ "$BACKOFF" -gt "$BACKOFF_MAX" ] && BACKOFF=$BACKOFF_MAX
+  return 0
+}
+
+sleep_interval() { # CHECK_INTERVAL in 1s slices; rc 1 when the tunnel dies mid-sleep
+  local n=0
+  while [ "$n" -lt "$CHECK_INTERVAL" ]; do
+    if [ -n "$TUNNEL_PID" ] && ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+      return 1
+    fi
+    sleep 1
+    n=$(( n + 1 ))
+  done
+  return 0
+}
+
+cmd_watch() {
+  trap sup_term TERM INT
+  ensure_state_dir
+  printf '%s\n' "$$" > "$SUP_PIDFILE"
+  BACKOFF=$BACKOFF_BASE
+  PROBE_FAILS=0
+  WAITING_LOGGED=0
+  log "supervisor started (pid $$) ns=$NS svc=$SVC local=127.0.0.1:$LPORT host=$SSH_HOST"
+  while :; do
+    # tunnel death: noticed within ~1s of the exit (sleep_interval polls)
+    if [ -n "$TUNNEL_PID" ] && ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+      local held=$(( $(date +%s) - TUNNEL_STARTED ))
+      wait "$TUNNEL_PID" 2>/dev/null
+      log "tunnel (pid $TUNNEL_PID) exited after ${held}s; restart queued"
+      rm -f "$TUN_PIDFILE"
+      if [ "$held" -ge "$HELD_RESET" ]; then
+        BACKOFF=$BACKOFF_BASE
+      else
+        bump_backoff
+      fi
+      TUNNEL_PID=""
+    fi
+
+    if [ -n "$TUNNEL_PID" ]; then
+      if probe; then
+        if [ "$PROBE_FAILS" -gt 0 ]; then log "probe recovered: $PROBE_ANSWER"; fi
+        PROBE_FAILS=0
+      else
+        PROBE_FAILS=$(( PROBE_FAILS + 1 ))
+        log "probe failed ($PROBE_FAILS/$FAIL_THRESHOLD): $PROBE_ANSWER"
+        if [ "$PROBE_FAILS" -ge "$FAIL_THRESHOLD" ]; then
+          log "restarting tunnel after $PROBE_FAILS failed probes (address will be re-resolved)"
+          kill "$TUNNEL_PID" 2>/dev/null
+          wait "$TUNNEL_PID" 2>/dev/null
+          rm -f "$TUN_PIDFILE"
+          TUNNEL_PID=""
+          PROBE_FAILS=0
+        fi
+      fi
+      sleep_interval
+      continue
+    fi
+
+    # no tunnel of ours: if the port already answers, another forward owns it —
+    # never fight it, just wait until it stops answering.
+    if probe; then
+      if [ "$WAITING_LOGGED" -eq 0 ]; then
+        log "local port $LPORT already served by another forward; waiting"
+        WAITING_LOGGED=1
+      fi
+      sleep "$CHECK_INTERVAL"
+      continue
+    fi
+    WAITING_LOGGED=0
+
+    if [ "$BACKOFF" -gt "$BACKOFF_BASE" ]; then
+      log "backing off ${BACKOFF}s before the next tunnel start"
+      sleep "$BACKOFF"
+      probe && continue # someone took the port meanwhile -> waiting branch
+    fi
+
+    local addr
+    if addr=$(resolve_addr); then
+      log "resolved $NS/$SVC -> $addr:$RPORT; starting tunnel"
+      start_tunnel "$addr"
+      log "tunnel started (pid $TUNNEL_PID)"
+      sleep 2 # give ExitOnForwardFailure a moment to speak up
+      if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        wait "$TUNNEL_PID" 2>/dev/null
+        log "tunnel (pid $TUNNEL_PID) exited immediately after start"
+        rm -f "$TUN_PIDFILE"
+        bump_backoff
+        TUNNEL_PID=""
+      fi
+    else
+      log "could not resolve $NS/$SVC via $SSH_HOST; will retry"
+      bump_backoff
+    fi
+  done
+}
+
+# --- commands -----------------------------------------------------------------
+
+# print_status: prints the one-line status; rc 0 when the service answers locally
+print_status() {
+  local sup="none" p=0 tunnel_up=0 addr="-" state a
+  if p=$(read_pid "$SUP_PIDFILE" 2>/dev/null) && kill -0 "$p" 2>/dev/null; then
+    sup="$p"
+  fi
+  if tunnel_alive; then tunnel_up=1; fi
+  if probe; then p=0; else p=1; fi
+  if [ "$p" -eq 0 ]; then
+    if [ "$tunnel_up" -eq 1 ]; then state="up"
+    else state="up (served by another forward)"; fi
+  else
+    state="down"
+  fi
+  if [ "$tunnel_up" -eq 1 ] && [ -f "$ADDR_FILE" ]; then
+    a=$(cat "$ADDR_FILE" 2>/dev/null)
+    [ -n "$a" ] && addr="$a:$RPORT"
+  fi
+  printf '%s %s local_port=%s address=%s supervisor=%s probe=%s\n' \
+    "$SVC_KEY" "$state" "$LPORT" "$addr" "$sup" "$PROBE_ANSWER"
+  return "$p"
+}
+
+cmd_up() {
+  local p
+  if p=$(read_pid "$SUP_PIDFILE" 2>/dev/null) && kill -0 "$p" 2>/dev/null; then
+    echo "$SVC_KEY already running (supervisor pid $p)"
+    return 1
+  fi
+  rm -f "$SUP_PIDFILE"
+  ensure_state_dir
+  log "up requested"
+  nohup "$SELF_DIR/$PROG" "$SVC_KEY" watch >/dev/null 2>&1 &
+  local n=0 ok=0
+  while [ "$n" -lt 10 ]; do
+    if probe; then ok=1; break; fi
+    sleep 1
+    n=$(( n + 1 ))
+  done
+  print_status
+  [ "$ok" -eq 1 ] && return 0 || return 1
+}
+
+cmd_stop() {
+  local spid="" tpid="" stopped=0 w=0 sd=0 td=0
+  spid=$(read_pid "$SUP_PIDFILE" 2>/dev/null) || spid=""
+  tpid=$(read_pid "$TUN_PIDFILE" 2>/dev/null) || tpid=""
+  if [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null; then
+    kill "$spid" 2>/dev/null
+    stopped=1
+    log "stop: TERM to supervisor $spid"
+  fi
+  if [ -n "$tpid" ] && kill -0 "$tpid" 2>/dev/null; then
+    kill "$tpid" 2>/dev/null
+    stopped=1
+    log "stop: TERM to tunnel $tpid"
+  fi
+  if [ "$stopped" -eq 0 ]; then
+    rm -f "$SUP_PIDFILE" "$TUN_PIDFILE"
+    echo "$SVC_KEY not running"
+    return 0
+  fi
+  while [ "$w" -lt 8 ]; do
+    sd=1; td=1
+    [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null && sd=0
+    [ -n "$tpid" ] && kill -0 "$tpid" 2>/dev/null && td=0
+    [ "$sd" -eq 1 ] && [ "$td" -eq 1 ] && break
+    sleep 0.5
+    w=$(( w + 1 ))
+  done
+  if [ "$sd" -eq 0 ]; then kill -9 "$spid" 2>/dev/null; log "stop: KILL to supervisor $spid"; fi
+  if [ "$td" -eq 0 ]; then kill -9 "$tpid" 2>/dev/null; log "stop: KILL to tunnel $tpid"; fi
+  rm -f "$SUP_PIDFILE" "$TUN_PIDFILE" "$ADDR_FILE"
+  log "stopped"
+  echo "$SVC_KEY stopped"
+  return 0
+}
+
+cmd_logs() {
+  if [ -f "$LOG" ]; then
+    tail -n 40 "$LOG"
+  else
+    echo "$SVC_KEY: no log yet ($LOG)"
+  fi
+  return 0
+}
+
+case $CMD in
+  up) cmd_up ;;
+  start|watch) cmd_watch ;;
+  stop) cmd_stop ;;
+  restart) cmd_stop; cmd_up ;;
+  status) print_status ;;
+  logs) cmd_logs ;;
+esac
+exit $?

@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 2026-11-26
+
+- bin/tunnel-watchdog + bin/{db,valkey,weaviate}-watchdog: SSH tunnel watchdogs for when the cluster API is unreachable from this Mac — each keeps `ssh -N -L 127.0.0.1:<local>:<clusterIP>:<remote> noizu.server` alive and restarts it on disconnect (exit noticed within ~1s; back-off doubles 1→60s while starts keep failing, reset after a tunnel has held a minute; 3 failed probes ⇒ tunnel killed and the address re-resolved; 20s probe cadence). The clusterIP is resolved on the host with read-only `kubectl --context noizu -n <ns> get svc` at every start (addresses drift; nothing hardcoded). If the local port already answers as the expected service it waits (`up (served by another forward)`) instead of fighting the other forward, and it never kills a process it did not start. Probes: pg_isready / redis-cli PING (any answer incl. NOAUTH counts) / weaviate ready=200, bash `/dev/tcp` fallback. State (pidfiles + log, mode 700) under `~/.local/state/tunnel-watchdog/`; env overrides `TUNNEL_SSH_HOST`, `TUNNEL_KUBE_CONTEXT`, `TUNNEL_{DB,VALKEY,WEAVIATE}_{LOCAL,REMOTE}_PORT`.
+- Makefile: install the four watchdogs into `~/.local/bin` alongside cluster-port-forward; new `make uninstall` (removes only the watchdogs); `make test` bash -n's them and runs the new suite.
+- test/watchdog-tests.sh + test/fixtures/watchdog/: sandboxed assertion suite (fixture ssh/pg_isready/redis-cli/curl first on PATH; no cluster access, no real ssh, none of the real loopback ports bound) — down/waiting/up status lines, supervisor+tunnel lifecycle, restart-on-exit, stop killing only its own pids, per-service ns/svc/port/probe facts, thin-entry resolution through a copy and a symlink.
+- README.md: SSH Tunnel Watchdogs section (why, verbs, table, no-fight rule, safety, launchd pointer).
+
 ## 2026-10-28
 
 - docs: add AGENT-README.md (agent orientation)
